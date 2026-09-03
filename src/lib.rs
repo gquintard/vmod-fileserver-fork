@@ -16,9 +16,7 @@ use std::time::SystemTime;
 use chrono::{DateTime, Utc};
 use openat::Dir;
 use varnish::run_vtc_tests;
-use varnish::vcl::{
-    Backend, Ctx, HttpHeaders, LogTag, StrOrBytes, VclBackend, VclResponse, VclResult,
-};
+use varnish::vcl::{Backend, Ctx, LogTag, StrOrBytes, VclBackend, VclResponse, VclResult};
 
 run_vtc_tests!("tests/*.vtc");
 
@@ -214,11 +212,16 @@ mod fileserver {
         ///
         /// - Only `GET` and `HEAD` requests are served; anything else gets a 405.
         /// - The request URL's query string, if any, is ignored when
-        ///   resolving the file on disk.
+        ///   resolving the file on disk. The path itself is percent-decoded;
+        ///   a malformed or unsafe percent-encoding gets a 400.
         /// - A missing file returns 404; an unreadable one returns 403.
         /// - Unless `follow_links` was set on the constructor, a request
         ///   that hits a symlink anywhere in its path fails instead of
         ///   being served.
+        /// - A request that resolves to a directory gets a 301 (adding a
+        ///   trailing slash) if it's missing one, otherwise the first
+        ///   matching `index_file`, a generated listing (if `autoindex` is
+        ///   on), or a 403. A trailing slash on a regular file gets a 404.
         /// - `etag`/`if-none-match` and `last-modified`/`if-modified-since`
         ///   are supported. `etag` is derived from the file's inode, size,
         ///   and modification time (if available).
@@ -264,7 +267,7 @@ impl FileBackend {
             candidate_segments.push(name.clone());
             let candidate = match &self.root_dir {
                 Some(root_dir) => open_through_dir(root_dir, &candidate_segments),
-                None => File::open(dir_path.join(name)),
+                None => open_regular_at(&dir_path.join(name)),
             };
             let Ok(candidate_f) = candidate else {
                 continue;
@@ -291,8 +294,7 @@ impl FileBackend {
     )]
     fn serve_missing_index(
         &self,
-        bereq: &HttpHeaders,
-        beresp: &mut HttpHeaders,
+        ctx: &mut Ctx,
         segments: &[String],
         dir_path: &std::path::Path,
         is_get: bool,
@@ -302,37 +304,61 @@ impl FileBackend {
             // 403 below, since there's no renderer built in
             #[cfg(feature = "autoindex")]
             {
-                let accept = bereq.header("accept").map(sob_helper);
+                let bereq = ctx
+                    .http_bereq
+                    .as_ref()
+                    .expect("bereq is set during a backend fetch");
+                let accept = bereq.header("accept").and_then(sob_helper);
                 let display_path = normalized_url_path(segments);
-                if let Ok((body, content_type)) =
-                    self.render_autoindex(&display_path, segments, dir_path, accept)
-                {
-                    beresp.set_status(200);
-                    // the body depends on the accept header
-                    beresp.set_header("vary", "accept")?;
-                    beresp.set_header("content-length", &format!("{}", body.len()))?;
-                    beresp.set_header("content-type", content_type)?;
-                    let transfer = is_get.then(|| FileTransfer::Mem(Cursor::new(body)));
-                    return Ok(transfer);
+                match self.render_autoindex(&display_path, segments, dir_path, accept) {
+                    Ok((body, content_type)) => {
+                        let beresp = ctx
+                            .http_beresp
+                            .as_mut()
+                            .expect("beresp is set during a backend fetch");
+                        beresp.set_status(200);
+                        // the body depends on the accept header
+                        beresp.set_header("vary", "accept")?;
+                        beresp.set_header("content-length", &format!("{}", body.len()))?;
+                        beresp.set_header("content-type", content_type)?;
+                        let transfer = is_get.then(|| FileTransfer::Mem(Cursor::new(body)));
+                        return Ok(transfer);
+                    }
+                    Err(e) => {
+                        ctx.log(
+                            LogTag::Error,
+                            format!("fileserver: could not generate a directory listing: {e}"),
+                        );
+                        let beresp = ctx
+                            .http_beresp
+                            .as_mut()
+                            .expect("beresp is set during a backend fetch");
+                        beresp.set_status(403);
+                        return Ok(None);
+                    }
                 }
-                // same treatment as any other fs error
-                beresp.set_status(403);
-                return Ok(None);
             }
         }
         // no index file, and autoindex is off (or compiled out): matches
         // nginx's behavior for the same case
+        let beresp = ctx
+            .http_beresp
+            .as_mut()
+            .expect("beresp is set during a backend fetch");
         beresp.set_status(403);
         Ok(None)
     }
 }
 
-// silly helper until varnish-rs provides something more ergonomic
+// silly helper until varnish-rs provides something more ergonomic. Returns
+// None (rather than panicking) for non-UTF-8 input: a header value is
+// attacker-controlled, and a panic unwinding across the extern "C" backend
+// boundary aborts the whole worker process, not just this request
 #[expect(clippy::needless_pass_by_value)]
-fn sob_helper(sob: StrOrBytes<'_>) -> &str {
+fn sob_helper(sob: StrOrBytes<'_>) -> Option<&str> {
     match sob {
-        StrOrBytes::Bytes(_) => panic!("{sob:?} isn't a string"),
-        StrOrBytes::Utf8(s) => s,
+        StrOrBytes::Bytes(_) => None,
+        StrOrBytes::Utf8(s) => Some(s),
     }
 }
 
@@ -344,14 +370,20 @@ impl VclBackend<FileTransfer> for FileBackend {
             .http_bereq
             .as_ref()
             .expect("bereq is set during a backend fetch");
-        let bereq_url = sob_helper(bereq.url().expect("bereq always has a url"));
-        let method = bereq.method().map(sob_helper);
 
         // let's start building our response
         let beresp = ctx
             .http_beresp
             .as_mut()
             .expect("beresp is set during a backend fetch");
+
+        // a non-UTF-8 request URL can't be resolved to a filesystem path
+        let Some(bereq_url) = sob_helper(bereq.url().expect("bereq always has a url")) else {
+            beresp.set_status(400);
+            return Ok(None);
+        };
+        // same idea: a non-UTF-8 method obviously isn't GET/HEAD either
+        let method = bereq.method().and_then(sob_helper);
 
         // reject unsupported methods before touching the filesystem
         if method != Some("HEAD") && method != Some("GET") {
@@ -386,7 +418,8 @@ impl VclBackend<FileTransfer> for FileBackend {
             .http_bereq
             .as_ref()
             .expect("bereq is set during a backend fetch");
-        let bereq_url = sob_helper(bereq.url().expect("bereq always has a url"));
+        let bereq_url = sob_helper(bereq.url().expect("bereq always has a url"))
+            .expect("already validated as UTF-8 above");
         let beresp = ctx
             .http_beresp
             .as_mut()
@@ -401,7 +434,7 @@ impl VclBackend<FileTransfer> for FileBackend {
         // corresponding open_file/sub_dir call fail instead of following it
         let f = match &self.root_dir {
             Some(root_dir) => open_through_dir(root_dir, &segments),
-            None => File::open(&path),
+            None => open_regular_at(&path),
         };
         let mut f = match f {
             Ok(f) => f,
@@ -445,7 +478,7 @@ impl VclBackend<FileTransfer> for FileBackend {
                 metadata = idx_meta;
                 path = idx_path;
             } else {
-                return self.serve_missing_index(bereq, beresp, &segments, &path, is_get);
+                return self.serve_missing_index(ctx, &segments, &path, is_get);
             }
         } else if url_path.ends_with('/') {
             // a trailing slash only makes sense for a directory; matches nginx
@@ -482,12 +515,12 @@ impl VclBackend<FileTransfer> for FileBackend {
 
         // can we avoid sending a body?
         let mut is_304 = false;
-        if let Some(inm) = bereq.header("if-none-match").map(sob_helper) {
+        if let Some(inm) = bereq.header("if-none-match").and_then(sob_helper) {
             if inm == etag || (inm.starts_with("W/") && inm[2..] == etag) {
                 is_304 = true;
             }
         } else if let Some(modified) = modified
-            && let Some(ims) = bereq.header("if-modified-since").map(sob_helper)
+            && let Some(ims) = bereq.header("if-modified-since").and_then(sob_helper)
             && let Ok(t) = DateTime::parse_from_rfc2822(ims)
             && t >= modified
         {
@@ -632,16 +665,22 @@ impl FileBackend {
                 // O_PATH fds; list_dir(".") reopens a proper listable fd first
                 for entry in dir.list_dir(".")? {
                     let entry = entry?;
-                    let name = entry.file_name().to_string_lossy().into_owned();
+                    // a non-UTF-8 name can't round-trip through this vmod's
+                    // percent-decoded path scheme, so listing it would only
+                    // ever produce a permanently broken href -- skip it
+                    // rather than advertise a dead link
+                    let Some(name) = entry.file_name().to_str() else {
+                        continue;
+                    };
+                    let name = name.to_string();
                     // nginx-style: don't advertise dotfiles (.git, .htpasswd, ...)
                     if name.starts_with('.') {
                         continue;
                     }
                     // fstatat(AT_SYMLINK_NOFOLLOW) -- this *stats*, it never
                     // opens the entry, so a FIFO with no writer can't hang
-                    // the request, an unreadable-but-listable file doesn't
-                    // vanish from the listing, and the raw (not lossy) name
-                    // is used for the syscall so non-UTF-8 names still work
+                    // the request, and an unreadable-but-listable file doesn't
+                    // vanish from the listing
                     let Ok(md) = dir.metadata(entry.file_name()) else {
                         continue;
                     };
@@ -663,7 +702,11 @@ impl FileBackend {
                 // else in this mode
                 for entry in std::fs::read_dir(dir_path)? {
                     let entry = entry?;
-                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let file_name = entry.file_name();
+                    let Some(name) = file_name.to_str() else {
+                        continue;
+                    };
+                    let name = name.to_string();
                     if name.starts_with('.') {
                         continue;
                     }
@@ -993,8 +1036,37 @@ fn walk_segments<T>(
     }
 }
 
+// stats `name` first (fstatat, never blocks) and refuses to open it if
+// it's neither a regular file nor a directory: opening a FIFO with no
+// writer on the other end (or certain char/block devices) blocks the
+// calling thread forever, so a request for a FIFO placed in the root
+// (directly, or as an index_file candidate) must not reach open_file()
+fn open_regular(dir: &Dir, name: &str) -> std::io::Result<File> {
+    // a symlink is deliberately NOT rejected here: open_file()'s O_NOFOLLOW
+    // already makes it fail on its own, with its own (tested) error kind --
+    // this check only needs to keep FIFOs/sockets/devices from being opened
+    if let Ok(md) = dir.metadata(name)
+        && md.simple_type() == openat::SimpleType::Other
+    {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
+    dir.open_file(name)
+}
+
+// same guard as open_regular(), for the follow_links=true (no openat::Dir)
+// code paths, which resolve paths via plain std::fs instead
+fn open_regular_at(path: &std::path::Path) -> std::io::Result<File> {
+    if let Ok(md) = std::fs::metadata(path)
+        && !md.is_file()
+        && !md.is_dir()
+    {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
+    File::open(path)
+}
+
 fn open_through_dir(root: &Dir, segments: &[String]) -> std::io::Result<File> {
-    walk_segments(root, segments, |d, s| d.open_file(s))
+    walk_segments(root, segments, open_regular)
 }
 
 #[cfg(feature = "autoindex")]
@@ -1161,6 +1233,21 @@ mod tests {
     fn index_file_name_rejects_dot_and_dotdot() {
         assert!(validate_index_file_name(".").is_err());
         assert!(validate_index_file_name("..").is_err());
+    }
+
+    use super::sob_helper;
+    use varnish::vcl::StrOrBytes;
+
+    #[test]
+    fn sob_helper_returns_the_str_for_utf8() {
+        assert_eq!(sob_helper(StrOrBytes::Utf8("hello")), Some("hello"));
+    }
+
+    #[test]
+    fn sob_helper_returns_none_for_non_utf8_instead_of_panicking() {
+        // a header value is attacker-controlled; panicking here would abort
+        // the whole worker process across the extern "C" backend boundary
+        assert_eq!(sob_helper(StrOrBytes::Bytes(&[0xff, 0xfe])), None);
     }
 
     use super::url_escape;

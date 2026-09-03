@@ -9,6 +9,12 @@ shell {
 	mkfifo ${tmpdir}/dir/afifo
 	ln -s afile.txt ${tmpdir}/dir/alink
 	printf %s "space" > "${tmpdir}/dir/has space.txt"
+
+	# a non-UTF-8 name can't round-trip through percent-decoding, so it
+	# would only ever produce a dead link -- must be skipped, not crash
+	# rendering or otherwise break the rest of the listing
+	badname=$(printf '\377\376bad.txt')
+	printf %s "unnameable" > "${tmpdir}/dir/$badname"
 }
 
 varnish v1 -vcl {

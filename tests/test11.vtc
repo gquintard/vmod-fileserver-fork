@@ -15,6 +15,12 @@ shell {
 	printf %s "not actually evil" > "${tmpdir}/evil.example.com/index.html"
 
 	printf %s "space" > "${tmpdir}/has space.txt"
+
+	# a FIFO must never be opened directly: with no writer on the other
+	# end, open() blocks the calling thread forever
+	mkfifo ${tmpdir}/afifo
+	mkdir -p ${tmpdir}/fifoindex
+	mkfifo ${tmpdir}/fifoindex/index.html
 }
 
 varnish v1 -vcl {
@@ -88,4 +94,17 @@ client c1 {
 	txreq -url "/withhtml/index.html/"
 	rxresp
 	expect resp.status == 404
+
+	# a FIFO requested directly is never opened -- no writer means it
+	# would otherwise block the request forever
+	txreq -url "/afifo"
+	rxresp
+	expect resp.status == 403
+
+	# same for a FIFO named like an index_file candidate: it's not opened,
+	# and since it's the only candidate present, the request falls through
+	# to a 403 rather than hanging
+	txreq -url "/fifoindex/"
+	rxresp
+	expect resp.status == 403
 } -run

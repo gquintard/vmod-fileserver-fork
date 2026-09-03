@@ -116,11 +116,16 @@ Return the Varnish backend serving files under this object's root.
 
 - Only `GET` and `HEAD` requests are served; anything else gets a 405.
 - The request URL's query string, if any, is ignored when
-resolving the file on disk.
+resolving the file on disk. The path itself is percent-decoded;
+a malformed or unsafe percent-encoding gets a 400.
 - A missing file returns 404; an unreadable one returns 403.
 - Unless `follow_links` was set on the constructor, a request
 that hits a symlink anywhere in its path fails instead of
 being served.
+- A request that resolves to a directory gets a 301 (adding a
+trailing slash) if it's missing one, otherwise the first
+matching `index_file`, a generated listing (if `autoindex` is
+on), or a 403. A trailing slash on a regular file gets a 404.
 - `etag`/`if-none-match` and `last-modified`/`if-modified-since`
 are supported. `etag` is derived from the file's inode, size,
 and modification time (if available).
