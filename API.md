@@ -67,6 +67,49 @@ under `path` can point anywhere on disk and will be served,
 which can let a request escape `path` in a low-trust,
 multi-tenant setup.
 
+### Method `VOID <object>.index_file(STRING name)`
+
+Add `name` to the list of filenames tried, in the order they were
+added, when a request resolves to a directory.
+
+`name` must be a bare filename: it can't be an absolute path, and
+it can't contain a `/` (no subdirectories).
+
+Can only be called from `vcl_init`.
+
+### Method `VOID <object>.autoindex(BOOL on)`
+
+If `true`, a request that resolves to a directory with no
+matching `index_file` gets a generated directory listing instead
+of a 403. The format (HTML, JSON, or YAML) is chosen from the
+request's `accept` header, defaulting to HTML.
+
+Defaults to `false`. Has no effect if this build of the vmod was
+compiled without the `autoindex` Cargo feature (a directory with
+no matching `index_file` still gets a 403 either way).
+
+Can only be called from `vcl_init`.
+
+### Method `VOID <object>.autoindex_human_size(BOOL on)`
+
+If `true` (default), file sizes in a generated HTML directory
+listing are shown in a human-friendly form (e.g. `4.2K`), with
+the exact byte count available as a tooltip. If `false`, the
+exact byte count is shown directly.
+
+Only affects the HTML format. Can only be called from `vcl_init`.
+
+### Method `VOID <object>.autoindex_human_dates(BOOL on)`
+
+If `true` (default), last-modified dates in a generated HTML
+directory listing get a tooltip with the precise timestamp. If
+`false`, the tooltip is omitted.
+
+Either way the visible date uses the same format as nginx's own
+autoindex (e.g. `02-Sep-2026 17:18`).
+
+Only affects the HTML format. Can only be called from `vcl_init`.
+
 ### Method `BACKEND <object>.backend()`
 
 Return the Varnish backend serving files under this object's root.

@@ -1,19 +1,34 @@
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
+use std::fmt::Write as _;
 use std::fs::{File, Metadata};
 use std::hash::{Hash, Hasher};
+#[cfg(feature = "autoindex")]
+use std::io::Cursor;
 use std::io::{BufRead, BufReader, Read, Take};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use openat::Dir;
 use varnish::run_vtc_tests;
-use varnish::vcl::{Backend, Ctx, LogTag, StrOrBytes, VclBackend, VclResponse, VclResult};
+use varnish::vcl::{
+    Backend, Ctx, HttpHeaders, LogTag, StrOrBytes, VclBackend, VclResponse, VclResult,
+};
 
 run_vtc_tests!("tests/*.vtc");
+
+// these exercise the actual listing generation, which is a no-op without the
+// autoindex feature (a directory with no index_file just gets a 403); a
+// nested module keeps their generated idents from colliding with the ones above
+#[cfg(feature = "autoindex")]
+mod autoindex_vtc_tests {
+    ::varnish::run_vtc_tests!("tests/autoindex/*.vtc");
+}
 
 /// Serve files directly from Varnish, no external backend needed.
 ///
@@ -33,13 +48,15 @@ run_vtc_tests!("tests/*.vtc");
 #[varnish::vmod(docs = "API.md")]
 mod fileserver {
     use std::error::Error;
+    use std::sync::RwLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use openat::Dir;
     use varnish::ffi::VCL_BACKEND;
     use varnish::vcl::{Backend, Ctx};
 
     use super::file_backend;
-    use crate::{FileBackend, build_mime_dict};
+    use crate::{FileBackend, build_mime_dict, validate_index_file_name};
 
     // Rust implementation of the VCC object, it mirrors what happens in C, except
     // for a couple of points:
@@ -116,10 +133,81 @@ mod fileserver {
                     mimes,
                     path: path.to_string(),
                     root_dir,
+                    index_files: RwLock::new(Vec::new()),
+                    autoindex: AtomicBool::new(false),
+                    autoindex_human_size: AtomicBool::new(true),
+                    autoindex_human_dates: AtomicBool::new(true),
                 },
                 false,
             )?;
             Ok(file_backend { backend })
+        }
+
+        /// Add `name` to the list of filenames tried, in the order they were
+        /// added, when a request resolves to a directory.
+        ///
+        /// `name` must be a bare filename: it can't be an absolute path, and
+        /// it can't contain a `/` (no subdirectories).
+        ///
+        /// Can only be called from `vcl_init`.
+        #[restrict(vcl_init)]
+        pub fn index_file(&self, name: &str) -> Result<(), Box<dyn Error>> {
+            validate_index_file_name(name)?;
+            self.backend
+                .get_inner()
+                .index_files
+                .write()
+                .expect("index_files lock poisoned")
+                .push(name.to_string());
+            Ok(())
+        }
+
+        /// If `true`, a request that resolves to a directory with no
+        /// matching `index_file` gets a generated directory listing instead
+        /// of a 403. The format (HTML, JSON, or YAML) is chosen from the
+        /// request's `accept` header, defaulting to HTML.
+        ///
+        /// Defaults to `false`. Has no effect if this build of the vmod was
+        /// compiled without the `autoindex` Cargo feature (a directory with
+        /// no matching `index_file` still gets a 403 either way).
+        ///
+        /// Can only be called from `vcl_init`.
+        #[restrict(vcl_init)]
+        pub fn autoindex(&self, on: bool) {
+            self.backend
+                .get_inner()
+                .autoindex
+                .store(on, Ordering::Relaxed);
+        }
+
+        /// If `true` (default), file sizes in a generated HTML directory
+        /// listing are shown in a human-friendly form (e.g. `4.2K`), with
+        /// the exact byte count available as a tooltip. If `false`, the
+        /// exact byte count is shown directly.
+        ///
+        /// Only affects the HTML format. Can only be called from `vcl_init`.
+        #[restrict(vcl_init)]
+        pub fn autoindex_human_size(&self, on: bool) {
+            self.backend
+                .get_inner()
+                .autoindex_human_size
+                .store(on, Ordering::Relaxed);
+        }
+
+        /// If `true` (default), last-modified dates in a generated HTML
+        /// directory listing get a tooltip with the precise timestamp. If
+        /// `false`, the tooltip is omitted.
+        ///
+        /// Either way the visible date uses the same format as nginx's own
+        /// autoindex (e.g. `02-Sep-2026 17:18`).
+        ///
+        /// Only affects the HTML format. Can only be called from `vcl_init`.
+        #[restrict(vcl_init)]
+        pub fn autoindex_human_dates(&self, on: bool) {
+            self.backend
+                .get_inner()
+                .autoindex_human_dates
+                .store(on, Ordering::Relaxed);
         }
 
         /// Return the Varnish backend serving files under this object's root.
@@ -152,6 +240,91 @@ struct FileBackend {
     path: String,                           // top directory of our backend
     mimes: Option<HashMap<String, String>>, // a hashmap linking extensions to maps (optional)
     root_dir: Option<Dir>, // Some(root) unless follow_links=true; requests are resolved through it, one non-symlink segment at a time
+    // candidate filenames tried (in order) when a request resolves to a
+    // directory; only ever written from vcl_init (index_file() is
+    // #[restrict(vcl_init)]), so request handling only ever needs a read lock
+    index_files: RwLock<Vec<String>>,
+    autoindex: AtomicBool,
+    autoindex_human_size: AtomicBool,
+    autoindex_human_dates: AtomicBool,
+}
+
+impl FileBackend {
+    // looks for the first configured index_file that exists as a regular
+    // file (not a directory) directly inside the directory `segments`
+    // resolves to
+    fn find_index_file(
+        &self,
+        segments: &[String],
+        dir_path: &std::path::Path,
+    ) -> Option<(File, Metadata, PathBuf)> {
+        let index_files = self.index_files.read().expect("index_files lock poisoned");
+        for name in index_files.iter() {
+            let mut candidate_segments = segments.to_vec();
+            candidate_segments.push(name.clone());
+            let candidate = match &self.root_dir {
+                Some(root_dir) => open_through_dir(root_dir, &candidate_segments),
+                None => File::open(dir_path.join(name)),
+            };
+            let Ok(candidate_f) = candidate else {
+                continue;
+            };
+            let Ok(candidate_meta) = candidate_f.metadata() else {
+                continue;
+            };
+            if candidate_meta.is_dir() {
+                continue;
+            }
+            return Some((candidate_f, candidate_meta, dir_path.join(name)));
+        }
+        None
+    }
+
+    // no index file matched: render a directory listing if autoindex is on
+    // (and this build has the renderer), otherwise 403 -- matches nginx.
+    // Without the `autoindex` feature, every parameter below the first two
+    // goes unused, and the function never actually fails (the renderer
+    // that would use them, and the fallible header calls, aren't compiled in)
+    #[cfg_attr(
+        not(feature = "autoindex"),
+        allow(unused_variables, clippy::unnecessary_wraps)
+    )]
+    fn serve_missing_index(
+        &self,
+        bereq: &HttpHeaders,
+        beresp: &mut HttpHeaders,
+        segments: &[String],
+        dir_path: &std::path::Path,
+        is_get: bool,
+    ) -> VclResult<Option<FileTransfer>> {
+        if self.autoindex.load(Ordering::Relaxed) {
+            // no-op without the `autoindex` feature: falls through to the
+            // 403 below, since there's no renderer built in
+            #[cfg(feature = "autoindex")]
+            {
+                let accept = bereq.header("accept").map(sob_helper);
+                let display_path = normalized_url_path(segments);
+                if let Ok((body, content_type)) =
+                    self.render_autoindex(&display_path, segments, dir_path, accept)
+                {
+                    beresp.set_status(200);
+                    // the body depends on the accept header
+                    beresp.set_header("vary", "accept")?;
+                    beresp.set_header("content-length", &format!("{}", body.len()))?;
+                    beresp.set_header("content-type", content_type)?;
+                    let transfer = is_get.then(|| FileTransfer::Mem(Cursor::new(body)));
+                    return Ok(transfer);
+                }
+                // same treatment as any other fs error
+                beresp.set_status(403);
+                return Ok(None);
+            }
+        }
+        // no index file, and autoindex is off (or compiled out): matches
+        // nginx's behavior for the same case
+        beresp.set_status(403);
+        Ok(None)
+    }
 }
 
 // silly helper until varnish-rs provides something more ergonomic
@@ -172,6 +345,21 @@ impl VclBackend<FileTransfer> for FileBackend {
             .as_ref()
             .expect("bereq is set during a backend fetch");
         let bereq_url = sob_helper(bereq.url().expect("bereq always has a url"));
+        let method = bereq.method().map(sob_helper);
+
+        // let's start building our response
+        let beresp = ctx
+            .http_beresp
+            .as_mut()
+            .expect("beresp is set during a backend fetch");
+
+        // reject unsupported methods before touching the filesystem
+        if method != Some("HEAD") && method != Some("GET") {
+            // we are fairly strict in what method we accept
+            beresp.set_status(405);
+            return Ok(None);
+        }
+        let is_get = method == Some("GET");
 
         // combine root and url into something that's hopefully safe. The query
         // string (if any) is not part of the filesystem path -- nginx and Apache
@@ -179,7 +367,14 @@ impl VclBackend<FileTransfer> for FileBackend {
         // the query string for static-file lookups, so a request like
         // "/app.js?v=123" (a common cache-busting pattern) must still resolve to
         // "/app.js" on disk, not literally fail to find a file named "app.js?v=123".
-        let path = assemble_file_path(&self.path, strip_query(bereq_url));
+        // Segments are percent-decoded and ".."-clamped by clamp_segments(); a
+        // malformed or unsafe percent-encoding (see percent_decode_segment) is
+        // rejected with 400 rather than being passed through to the filesystem.
+        let Ok(segments) = clamp_segments(strip_query(bereq_url)) else {
+            beresp.set_status(400);
+            return Ok(None);
+        };
+        let mut path = join_segments(&self.path, &segments);
         ctx.log(
             LogTag::Debug,
             format!("fileserver: file on disk: {}", path.display()),
@@ -192,21 +387,11 @@ impl VclBackend<FileTransfer> for FileBackend {
             .as_ref()
             .expect("bereq is set during a backend fetch");
         let bereq_url = sob_helper(bereq.url().expect("bereq always has a url"));
-
-        // let's start building our response
         let beresp = ctx
             .http_beresp
             .as_mut()
             .expect("beresp is set during a backend fetch");
-
-        // reject unsupported methods before touching the filesystem
-        let method = bereq.method().map(sob_helper);
-        if method != Some("HEAD") && method != Some("GET") {
-            // we are fairly strict in what method we accept
-            beresp.set_status(405);
-            return Ok(None);
-        }
-        let is_get = method == Some("GET");
+        let url_path = strip_query(bereq_url);
 
         // open the file and get some metadata. Unless the VCL author wants
         // symlinks followed unconditionally (follow_links), walk the
@@ -215,10 +400,10 @@ impl VclBackend<FileTransfer> for FileBackend {
         // (inside or outside the root, we don't distinguish) makes the
         // corresponding open_file/sub_dir call fail instead of following it
         let f = match &self.root_dir {
-            Some(root_dir) => open_through_dir(root_dir, &clamp_segments(strip_query(bereq_url))),
+            Some(root_dir) => open_through_dir(root_dir, &segments),
             None => File::open(&path),
         };
-        let f = match f {
+        let mut f = match f {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 beresp.set_status(404);
@@ -231,7 +416,43 @@ impl VclBackend<FileTransfer> for FileBackend {
             Err(e) => return Err(e.to_string().into()),
         };
 
-        let metadata: Metadata = f.metadata().map_err(|e| e.to_string())?;
+        let mut metadata: Metadata = f.metadata().map_err(|e| e.to_string())?;
+
+        if metadata.is_dir() {
+            // directories need a trailing slash so relative links in a
+            // generated listing (or in the index file it serves) resolve
+            // correctly -- redirect if it's missing, same as nginx. The
+            // Location is rebuilt from the normalized, re-escaped segments
+            // (not echoed back from the raw request) so a directory that
+            // happens to be named e.g. "evil.example.com" can't turn a
+            // request for "//evil.example.com" into a scheme-relative
+            // Location that browsers resolve as "http://evil.example.com/"
+            if !url_path.ends_with('/') {
+                let mut location = normalized_url_path(&segments);
+                if let Some((_, q)) = bereq_url.split_once('?') {
+                    location.push('?');
+                    location.push_str(q);
+                }
+                beresp.set_status(301);
+                beresp.set_header("location", &location)?;
+                return Ok(None);
+            }
+
+            if let Some((idx_f, idx_meta, idx_path)) = self.find_index_file(&segments, &path) {
+                // an index file was found: fall through to the normal
+                // file-serving logic below, as if it had been requested directly
+                f = idx_f;
+                metadata = idx_meta;
+                path = idx_path;
+            } else {
+                return self.serve_missing_index(bereq, beresp, &segments, &path, is_get);
+            }
+        } else if url_path.ends_with('/') {
+            // a trailing slash only makes sense for a directory; matches nginx
+            beresp.set_status(404);
+            return Ok(None);
+        }
+
         let cl = metadata.len();
         let modified_raw = match metadata.modified() {
             Ok(t) => Some(t),
@@ -284,10 +505,8 @@ impl VclBackend<FileTransfer> for FileBackend {
             // and add a BackendResp to the priv1 field
             beresp.set_status(200);
             if is_get {
-                transfer = Some(FileTransfer {
-                    // prevent reading more than expected
-                    reader: BufReader::new(f).take(cl),
-                });
+                // prevent reading more than expected
+                transfer = Some(FileTransfer::File(BufReader::new(f).take(cl)));
             }
         }
 
@@ -314,17 +533,298 @@ impl VclBackend<FileTransfer> for FileBackend {
     }
 }
 
-struct FileTransfer {
-    reader: Take<BufReader<File>>,
+enum FileTransfer {
+    File(Take<BufReader<File>>),
+    #[cfg(feature = "autoindex")]
+    Mem(Cursor<Vec<u8>>),
 }
 
 impl VclResponse for FileTransfer {
     fn read(&mut self, buf: &mut [u8]) -> VclResult<usize> {
-        self.reader.read(buf).map_err(|e| e.to_string().into())
+        match self {
+            FileTransfer::File(r) => r.read(buf).map_err(|e| e.to_string().into()),
+            #[cfg(feature = "autoindex")]
+            FileTransfer::Mem(r) => r.read(buf).map_err(|e| e.to_string().into()),
+        }
     }
     fn len(&self) -> Option<usize> {
-        Some(usize::try_from(self.reader.limit()).expect("casting u64 to usize"))
+        match self {
+            FileTransfer::File(r) => {
+                Some(usize::try_from(r.limit()).expect("casting u64 to usize"))
+            }
+            #[cfg(feature = "autoindex")]
+            FileTransfer::Mem(r) => Some(
+                r.get_ref().len() - usize::try_from(r.position()).expect("casting u64 to usize"),
+            ),
+        }
     }
+}
+
+#[cfg(feature = "autoindex")]
+#[derive(serde::Serialize)]
+struct AutoindexEntry {
+    name: String,
+    is_dir: bool,
+    // None for directories: a directory's on-disk "size" is an
+    // implementation detail (block usage for its own directory entries),
+    // not something a listing should show, in either JSON/YAML or HTML
+    size: Option<u64>,
+    modified: Option<DateTime<Utc>>,
+}
+
+#[cfg(feature = "autoindex")]
+enum AutoindexFormat {
+    Html,
+    Json,
+    Yaml,
+}
+
+#[cfg(feature = "autoindex")]
+impl AutoindexFormat {
+    fn content_type(&self) -> &'static str {
+        match self {
+            AutoindexFormat::Html => "text/html; charset=utf-8",
+            AutoindexFormat::Json => "application/json",
+            AutoindexFormat::Yaml => "application/x-yaml",
+        }
+    }
+}
+
+// picks the response format from the `accept` header; a simple substring
+// match, not full quality-value (q=) negotiation -- unmatched or missing
+// `accept` falls back to HTML
+#[cfg(feature = "autoindex")]
+fn pick_autoindex_format(accept: Option<&str>) -> AutoindexFormat {
+    let Some(accept) = accept else {
+        return AutoindexFormat::Html;
+    };
+    if accept.contains("application/json") {
+        AutoindexFormat::Json
+    } else if accept.contains("application/x-yaml")
+        || accept.contains("application/yaml")
+        || accept.contains("text/yaml")
+    {
+        AutoindexFormat::Yaml
+    } else {
+        AutoindexFormat::Html
+    }
+}
+
+#[cfg(feature = "autoindex")]
+impl FileBackend {
+    // builds a directory listing body plus its content-type, in the format
+    // picked from `accept`
+    fn render_autoindex(
+        &self,
+        url_path: &str,
+        segments: &[String],
+        dir_path: &std::path::Path,
+        accept: Option<&str>,
+    ) -> Result<(Vec<u8>, &'static str), Box<dyn Error>> {
+        let mut entries = Vec::new();
+        match &self.root_dir {
+            Some(root_dir) => {
+                // walk to the directory the same symlink-safe way as everywhere
+                // else in this file, then list it relative to that handle
+                let dir = open_dir_through(root_dir, segments)?;
+                // NOT dir.list_self(): `dir` is opened with O_PATH (like every
+                // Dir in the openat crate on Linux), and fdopendir() rejects
+                // O_PATH fds; list_dir(".") reopens a proper listable fd first
+                for entry in dir.list_dir(".")? {
+                    let entry = entry?;
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    // nginx-style: don't advertise dotfiles (.git, .htpasswd, ...)
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                    // fstatat(AT_SYMLINK_NOFOLLOW) -- this *stats*, it never
+                    // opens the entry, so a FIFO with no writer can't hang
+                    // the request, an unreadable-but-listable file doesn't
+                    // vanish from the listing, and the raw (not lossy) name
+                    // is used for the syscall so non-UTF-8 names still work
+                    let Ok(md) = dir.metadata(entry.file_name()) else {
+                        continue;
+                    };
+                    // reports the symlink's own metadata rather than
+                    // following it, so skip it here, matching follow_links=false
+                    if md.simple_type() == openat::SimpleType::Symlink {
+                        continue;
+                    }
+                    entries.push(AutoindexEntry {
+                        name,
+                        is_dir: md.is_dir(),
+                        size: (!md.is_dir()).then_some(md.len()),
+                        modified: openat_modified(&md).map(DateTime::from),
+                    });
+                }
+            }
+            None => {
+                // follow_links=true: dereference symlinks like everywhere
+                // else in this mode
+                for entry in std::fs::read_dir(dir_path)? {
+                    let entry = entry?;
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                    let Ok(md) = std::fs::metadata(entry.path()) else {
+                        continue;
+                    };
+                    entries.push(AutoindexEntry {
+                        name,
+                        is_dir: md.is_dir(),
+                        size: (!md.is_dir()).then_some(md.len()),
+                        modified: md.modified().ok().map(DateTime::from),
+                    });
+                }
+            }
+        }
+        // nginx-style: directories before files, each group alphabetical
+        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+
+        let format = pick_autoindex_format(accept);
+        let body = match format {
+            AutoindexFormat::Json => serde_json::to_vec(&entries)?,
+            AutoindexFormat::Yaml => yaml_serde::to_string(&entries)?.into_bytes(),
+            AutoindexFormat::Html => render_autoindex_html(
+                url_path,
+                &entries,
+                self.autoindex_human_size.load(Ordering::Relaxed),
+                self.autoindex_human_dates.load(Ordering::Relaxed),
+            )
+            .into_bytes(),
+        };
+        Ok((body, format.content_type()))
+    }
+}
+
+// mimics the classic nginx/Apache `<pre>`-based autoindex layout: a page
+// titled "Index of <path>", a link back to the parent directory, then one
+// line per entry with the name, date, and size lined up in columns
+#[cfg(feature = "autoindex")]
+fn render_autoindex_html(
+    url_path: &str,
+    entries: &[AutoindexEntry],
+    human_size: bool,
+    human_dates: bool,
+) -> String {
+    const NAME_COL: usize = 50;
+    const SIZE_COL: usize = 19;
+
+    let title = html_escape(url_path);
+    let mut out = format!(
+        "<html>\n<head><title>Index of {title}</title></head>\n<body>\n<h1>Index of {title}</h1><hr><pre>"
+    );
+    if url_path != "/" {
+        out.push_str("<a href=\"../\">../</a>\n");
+    }
+    for e in entries {
+        let display_name = if e.is_dir {
+            format!("{}/", e.name)
+        } else {
+            e.name.clone()
+        };
+        let href = url_escape(&display_name);
+
+        // long names get truncated for column alignment, same as nginx; the
+        // href above still carries the full, untruncated name. Either way at
+        // least one space always separates the name from the date column:
+        // a name that's exactly NAME_COL chars long must not collide with it
+        let name_len = display_name.chars().count();
+        let (shown_name, pad_len) = if name_len >= NAME_COL {
+            let truncated: String = display_name.chars().take(NAME_COL - 3).collect();
+            (format!("{truncated}..>"), 0)
+        } else {
+            (display_name, NAME_COL - name_len)
+        };
+        let name = html_escape(&shown_name);
+        let name_pad = " ".repeat(pad_len + 1);
+
+        let date_html = match e.modified {
+            None => "-".to_string(),
+            // nginx's own autoindex always renders this exact format; we
+            // only add the tooltip (with the precise timestamp) on top when
+            // human_dates is on
+            Some(m) if human_dates => format!(
+                "<span title=\"{}\">{}</span>",
+                m.to_rfc3339(),
+                m.format("%d-%b-%Y %H:%M")
+            ),
+            Some(m) => m.format("%d-%b-%Y %H:%M").to_string(),
+        };
+
+        let size_text = match e.size {
+            None => "-".to_string(),
+            Some(sz) if human_size => human_readable_size(sz),
+            Some(sz) => sz.to_string(),
+        };
+        let size_pad = " ".repeat(SIZE_COL.saturating_sub(size_text.chars().count()));
+        let size_html = match e.size {
+            Some(sz) if human_size => {
+                format!("<span title=\"{sz} bytes\">{size_text}</span>")
+            }
+            _ => size_text,
+        };
+
+        let _ = writeln!(
+            out,
+            "<a href=\"{href}\">{name}</a>{name_pad}{date_html}  {size_pad}{size_html}"
+        );
+    }
+    out.push_str("</pre><hr></body>\n</html>\n");
+    out
+}
+
+#[cfg(feature = "autoindex")]
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+#[cfg(feature = "autoindex")]
+fn human_readable_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    #[allow(clippy::cast_precision_loss)]
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes}B")
+    } else {
+        format!("{size:.1}{}", UNITS[unit])
+    }
+}
+
+// openat::Metadata (fstatat-based) has no portable `.modified()` like
+// std::fs::Metadata -- build one from the raw stat's mtime fields instead.
+// st_mtime/st_mtime_nsec have the same names on Linux and macOS (the libc
+// crate standardizes them), so this is portable across this vmod's
+// supported platforms
+#[cfg(feature = "autoindex")]
+fn openat_modified(md: &openat::Metadata) -> Option<SystemTime> {
+    let stat = md.stat();
+    let secs = u64::try_from(stat.st_mtime).ok()?;
+    let nsec = u32::try_from(stat.st_mtime_nsec).ok()?;
+    if nsec >= 1_000_000_000 {
+        return None;
+    }
+    Some(SystemTime::UNIX_EPOCH + std::time::Duration::new(secs, nsec))
+}
+
+// index_file() candidates must be a bare filename: no subdirectories, no
+// absolute paths, nothing that could turn a lookup into a path traversal
+fn validate_index_file_name(name: &str) -> Result<(), Box<dyn Error>> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(
+            format!("fileserver: index_file {name:?} must be a bare filename, not a path").into(),
+        );
+    }
+    Ok(())
 }
 
 // reads a mime database into a hashmap, if we can
@@ -355,64 +855,151 @@ fn strip_query(url: &str) -> &str {
     url.split_once('?').map_or(url, |(path, _)| path)
 }
 
-// split a request url into the list of path segments a file lookup should
-// use, clamping ".." so it can never walk above the root: this is purely
-// lexical (no filesystem access, no link resolution), so it says nothing
-// about symlinks -- that's handled separately, see open_through_dir()
-fn clamp_segments(url: &str) -> Vec<&str> {
-    let url_path = std::path::Path::new(url);
-    let mut components = Vec::new();
-
-    for c in url_path.components() {
-        use std::path::Component::{CurDir, Normal, ParentDir, Prefix, RootDir};
-        match c {
-            Prefix(_) => unreachable!(),
-            RootDir => {}
-            CurDir => (),
-            ParentDir => {
-                components.pop();
+// percent-decodes a single path segment (no '/' in the input, since callers
+// split on it first). Rejects a decoded '/' or NUL byte, and any malformed
+// escape, so a segment like "%2e%2e" (encoded "..") or "a%2fb" (encoded
+// "a/b") can't smuggle a fake path separator or terminator past
+// clamp_segments()'s lexical ".." handling, which runs on the *decoded*
+// value.
+fn percent_decode_segment(s: &str) -> Result<String, Box<dyn Error>> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes
+                .get(i + 1..i + 3)
+                .and_then(|h| std::str::from_utf8(h).ok())
+                .ok_or_else(|| format!("fileserver: malformed percent-encoding in {s:?}"))?;
+            let byte = u8::from_str_radix(hex, 16)
+                .map_err(|_| format!("fileserver: malformed percent-encoding in {s:?}"))?;
+            if byte == b'/' || byte == 0 {
+                return Err(format!("fileserver: invalid percent-encoded byte in {s:?}").into());
             }
-            Normal(s) => {
-                // we can unwrap as url_path was created from a &str
-                components.push(s.to_str().unwrap());
-            }
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
         }
     }
-    components
+    String::from_utf8(out).map_err(|_| format!("fileserver: invalid UTF-8 in {s:?}").into())
 }
 
-// given root_path and url, assemble the two so that the final path is still
-// inside root_path. Used for logging and mime-type lookup, and (when
-// follow_links=true) for the actual File::open -- see clamp_segments()
-fn assemble_file_path(root_path: &str, url: &str) -> PathBuf {
+// split a request url into the list of percent-decoded path segments a file
+// lookup should use, clamping ".." (encoded or not) so it can never walk
+// above the root: this is purely lexical (no filesystem access, no link
+// resolution), so it says nothing about symlinks -- that's handled
+// separately, see open_through_dir(). Segments are decoded here (rather
+// than left percent-encoded) so a link this vmod generates in a directory
+// listing resolves to the same file it was generated from.
+fn clamp_segments(url: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut components = Vec::new();
+    for raw in url.split('/') {
+        if raw.is_empty() {
+            continue;
+        }
+        let decoded = percent_decode_segment(raw)?;
+        match decoded.as_str() {
+            "." => {}
+            ".." => {
+                components.pop();
+            }
+            _ => components.push(decoded),
+        }
+    }
+    Ok(components)
+}
+
+// joins already-decoded path segments onto root_path
+fn join_segments(root_path: &str, segments: &[String]) -> PathBuf {
     assert_ne!(root_path, "");
 
     let mut complete_path = String::from(root_path);
-    for c in clamp_segments(url) {
+    for c in segments {
         complete_path.push('/');
         complete_path.push_str(c);
     }
     PathBuf::from(complete_path)
 }
 
-// walk `segments` one at a time relative to `root`, opening each
-// intermediate segment as a directory and the last one as a file, using
-// openat(2)'s O_NOFOLLOW at every hop (via the `openat` crate) so a
-// symlink anywhere along the way -- whether it points inside or outside
-// root, we don't distinguish -- makes the lookup fail instead of being
-// followed
-fn open_through_dir(root: &Dir, segments: &[&str]) -> std::io::Result<File> {
-    match segments {
-        [] => root.open_file("."),
-        [file] => root.open_file(*file),
-        [dirs @ .., file] => {
-            let mut cur = root.sub_dir(dirs[0])?;
-            for d in &dirs[1..] {
-                cur = cur.sub_dir(*d)?;
+// given root_path and url, assemble the two so that the final path is still
+// inside root_path -- a thin wrapper over clamp_segments()+join_segments(),
+// kept around for the tests below since get_response() needs the segments
+// and the path separately and so doesn't go through it
+#[cfg(test)]
+fn assemble_file_path(root_path: &str, url: &str) -> Result<PathBuf, Box<dyn Error>> {
+    Ok(join_segments(root_path, &clamp_segments(url)?))
+}
+
+// re-encodes decoded path segments back into a normalized, safe absolute
+// URL path (e.g. for a redirect Location or a directory listing's "Index
+// of ..." title): collapses whatever "//", ".", or ".." the original
+// request had (clamp_segments already did that), and re-escapes reserved
+// characters per segment so it can't be mistaken for a scheme-relative URL
+// (e.g. a request for a directory literally named "evil.example.com" must
+// not turn into a Location starting with "//evil.example.com")
+fn normalized_url_path(segments: &[String]) -> String {
+    let mut out = String::from("/");
+    for seg in segments {
+        out.push_str(&url_escape(seg));
+        out.push('/');
+    }
+    out
+}
+
+// percent-encode a filename for use in an href or URL path, so names with
+// spaces or other reserved characters don't produce a broken link; '/' is
+// left alone since it's only ever used here as a trailing directory marker
+// or a path separator we inserted ourselves, never as part of a decoded
+// segment (percent_decode_segment rejects a decoded '/' inside a segment)
+fn url_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char);
             }
-            cur.open_file(*file)
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
+    out
+}
+
+// walk `segments` one at a time relative to `root`, opening each
+// intermediate segment as a directory, using openat(2)'s O_NOFOLLOW at every
+// hop (via the `openat` crate) so a symlink anywhere along the way --
+// whether it points inside or outside root, we don't distinguish -- makes
+// the lookup fail instead of being followed. The final segment (or "."
+// if `segments` is empty) is handed to `open_last`, relative to wherever
+// the walk ended up, so callers can open it as either a file or a directory
+fn walk_segments<T>(
+    root: &Dir,
+    segments: &[String],
+    open_last: impl FnOnce(&Dir, &str) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    match segments {
+        [] => open_last(root, "."),
+        [last] => open_last(root, last.as_str()),
+        [dirs @ .., last] => {
+            let mut cur = root.sub_dir(dirs[0].as_str())?;
+            for d in &dirs[1..] {
+                cur = cur.sub_dir(d.as_str())?;
+            }
+            open_last(&cur, last.as_str())
+        }
+    }
+}
+
+fn open_through_dir(root: &Dir, segments: &[String]) -> std::io::Result<File> {
+    walk_segments(root, segments, |d, s| d.open_file(s))
+}
+
+#[cfg(feature = "autoindex")]
+fn open_dir_through(root: &Dir, segments: &[String]) -> std::io::Result<Dir> {
+    walk_segments(root, segments, |d, s| d.sub_dir(s))
 }
 
 fn generate_etag(metadata: &Metadata, modified: Option<SystemTime>) -> String {
@@ -440,7 +1027,10 @@ mod tests {
     use super::assemble_file_path;
 
     fn tc(root_path: &str, url: &str, expected: &str) {
-        assert_eq!(assemble_file_path(root_path, url), PathBuf::from(expected));
+        assert_eq!(
+            assemble_file_path(root_path, url).unwrap(),
+            PathBuf::from(expected)
+        );
     }
 
     #[test]
@@ -466,6 +1056,37 @@ mod tests {
     #[test]
     fn current() {
         tc("/foo/bar", "/bar/././qux", "/foo/bar/bar/qux");
+    }
+
+    #[test]
+    fn percent_decoded() {
+        tc("/foo/bar", "/has%20space.txt", "/foo/bar/has space.txt");
+    }
+
+    #[test]
+    fn percent_encoded_parent_is_clamped() {
+        // "%2e%2e" decodes to "..", and must be clamped exactly like a
+        // literal ".." -- otherwise it could walk above root_path once the
+        // decoded segment reaches the filesystem
+        tc("/foo/bar", "/bar/%2e%2e/qux", "/foo/bar/qux");
+    }
+
+    #[test]
+    fn percent_encoded_slash_is_rejected() {
+        // "%2f" decodes to '/', which would let a single URL segment smuggle
+        // in an extra path separator
+        assert!(super::clamp_segments("/foo%2fbar").is_err());
+    }
+
+    #[test]
+    fn percent_encoded_nul_is_rejected() {
+        assert!(super::clamp_segments("/foo%00bar").is_err());
+    }
+
+    #[test]
+    fn malformed_percent_encoding_is_rejected() {
+        assert!(super::clamp_segments("/foo%2").is_err());
+        assert!(super::clamp_segments("/foo%zz").is_err());
     }
 
     use super::strip_query;
@@ -512,5 +1133,115 @@ mod tests {
         assert_eq!(h["ty3"], "type3");
         assert_eq!(h["T3"], "type3");
         assert_eq!(h.get("t2"), None);
+    }
+
+    use super::validate_index_file_name;
+
+    #[test]
+    fn index_file_name_bare_filename_is_valid() {
+        assert!(validate_index_file_name("index.html").is_ok());
+    }
+
+    #[test]
+    fn index_file_name_rejects_subdirectory() {
+        assert!(validate_index_file_name("sub/index.html").is_err());
+    }
+
+    #[test]
+    fn index_file_name_rejects_absolute_path() {
+        assert!(validate_index_file_name("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn index_file_name_rejects_empty() {
+        assert!(validate_index_file_name("").is_err());
+    }
+
+    #[test]
+    fn index_file_name_rejects_dot_and_dotdot() {
+        assert!(validate_index_file_name(".").is_err());
+        assert!(validate_index_file_name("..").is_err());
+    }
+
+    use super::url_escape;
+
+    #[test]
+    fn url_escape_leaves_safe_chars_alone() {
+        assert_eq!(url_escape("abc-123_.~/"), "abc-123_.~/");
+    }
+
+    #[test]
+    fn url_escape_encodes_space_and_reserved_chars() {
+        assert_eq!(url_escape("a b#c?d"), "a%20b%23c%3Fd");
+    }
+
+    use super::normalized_url_path;
+
+    #[test]
+    fn normalized_url_path_root() {
+        assert_eq!(normalized_url_path(&[]), "/");
+    }
+
+    #[test]
+    fn normalized_url_path_nested() {
+        let segments = ["a".to_string(), "has space".to_string()];
+        assert_eq!(normalized_url_path(&segments), "/a/has%20space/");
+    }
+
+    #[cfg(feature = "autoindex")]
+    use super::html_escape;
+
+    #[cfg(feature = "autoindex")]
+    #[test]
+    fn html_escape_escapes_all_special_chars() {
+        assert_eq!(
+            html_escape("<a href=\"x\">&amp;</a>"),
+            "&lt;a href=&quot;x&quot;&gt;&amp;amp;&lt;/a&gt;"
+        );
+    }
+
+    #[cfg(feature = "autoindex")]
+    use super::human_readable_size;
+
+    #[cfg(feature = "autoindex")]
+    #[test]
+    fn human_readable_size_bytes() {
+        assert_eq!(human_readable_size(0), "0B");
+        assert_eq!(human_readable_size(1023), "1023B");
+    }
+
+    #[cfg(feature = "autoindex")]
+    #[test]
+    fn human_readable_size_kilobytes() {
+        assert_eq!(human_readable_size(2048), "2.0K");
+    }
+
+    #[cfg(feature = "autoindex")]
+    use super::pick_autoindex_format;
+
+    #[cfg(feature = "autoindex")]
+    #[test]
+    fn pick_autoindex_format_defaults_to_html() {
+        assert!(matches!(
+            pick_autoindex_format(None),
+            super::AutoindexFormat::Html
+        ));
+        assert!(matches!(
+            pick_autoindex_format(Some("text/plain")),
+            super::AutoindexFormat::Html
+        ));
+    }
+
+    #[cfg(feature = "autoindex")]
+    #[test]
+    fn pick_autoindex_format_matches_json_and_yaml() {
+        assert!(matches!(
+            pick_autoindex_format(Some("application/json")),
+            super::AutoindexFormat::Json
+        ));
+        assert!(matches!(
+            pick_autoindex_format(Some("application/x-yaml")),
+            super::AutoindexFormat::Yaml
+        ));
     }
 }

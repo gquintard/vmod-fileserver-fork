@@ -1,0 +1,71 @@
+varnishtest "autoindex: symlinks, dotfiles, FIFOs/unreadable files, hrefs, and Vary"
+
+shell {
+	mkdir -p ${tmpdir}/dir/adir
+	printf %s "hello" > ${tmpdir}/dir/afile.txt
+	printf %s "hidden" > ${tmpdir}/dir/.hidden
+	printf %s "no read for you" > ${tmpdir}/dir/noperm.txt
+	chmod 000 ${tmpdir}/dir/noperm.txt
+	mkfifo ${tmpdir}/dir/afifo
+	ln -s afile.txt ${tmpdir}/dir/alink
+	printf %s "space" > "${tmpdir}/dir/has space.txt"
+}
+
+varnish v1 -vcl {
+	import fileserver from "${vmod}";
+
+	backend default none;
+
+	sub vcl_init {
+		new safe = fileserver.root("${tmpdir}");
+		safe.autoindex(true);
+
+		new following = fileserver.root("${tmpdir}", follow_links = true);
+		following.autoindex(true);
+	}
+
+	sub vcl_recv {
+		if (req.http.which == "following") {
+			set req.backend_hint = following.backend();
+		} else {
+			set req.backend_hint = safe.backend();
+		}
+		return (pass);
+	}
+} -start
+
+client c1 {
+	# default (follow_links=false): a FIFO with no writer, and a file with no
+	# read permission, must not hang the request or vanish from the listing
+	# (both are only stat'd, never opened) -- but a symlink is skipped, since
+	# reporting its target's metadata would mean silently following it
+	txreq -url "/dir/"
+	rxresp
+	expect resp.status == 200
+	expect resp.body ~ "afile.txt"
+	expect resp.body ~ "adir/"
+	expect resp.body ~ "afifo"
+	expect resp.body ~ "noperm.txt"
+	expect resp.body !~ "alink"
+	# nginx-style: dotfiles aren't advertised
+	expect resp.body !~ {\.hidden}
+	# the response depends on accept, so downstream caches must not conflate
+	# different formats under one cache entry
+	expect resp.http.vary == "accept"
+
+	# a link this listing generates must actually resolve to the file it
+	# names, not 404 -- percent-encoding a name must round-trip
+	expect resp.body ~ {href="has%20space.txt"}
+	txreq -url "/dir/has%20space.txt"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "space"
+
+	# follow_links=true: symlinks are followed and show up like any other
+	# entry, matching the rest of this vmod's behavior in that mode
+	txreq -url "/dir/" -hdr "which: following"
+	rxresp
+	expect resp.status == 200
+	expect resp.body ~ "alink"
+	expect resp.body !~ {\.hidden}
+} -run

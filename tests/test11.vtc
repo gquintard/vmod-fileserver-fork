@@ -1,0 +1,91 @@
+varnishtest "index_file serves the first matching candidate in a directory"
+
+shell {
+	mkdir -p ${tmpdir}/withhtml
+	printf %s "html-index" > ${tmpdir}/withhtml/index.html
+
+	mkdir -p ${tmpdir}/withhtm
+	printf %s "htm-index" > ${tmpdir}/withhtm/index.htm
+
+	mkdir -p ${tmpdir}/empty
+
+	# a directory that could be mistaken for a host name, to check the
+	# trailing-slash redirect can't be turned into an open redirect
+	mkdir -p "${tmpdir}/evil.example.com"
+	printf %s "not actually evil" > "${tmpdir}/evil.example.com/index.html"
+
+	printf %s "space" > "${tmpdir}/has space.txt"
+}
+
+varnish v1 -vcl {
+	import fileserver from "${vmod}";
+
+	backend default none;
+
+	sub vcl_init {
+		new www = fileserver.root("${tmpdir}");
+		www.index_file("index.html");
+		www.index_file("index.htm");
+	}
+
+	sub vcl_recv {
+		set req.backend_hint = www.backend();
+		return (pass);
+	}
+} -start
+
+client c1 {
+	# first candidate present: served
+	txreq -url "/withhtml/"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "html-index"
+
+	# first candidate absent, falls back to the second
+	txreq -url "/withhtm/"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "htm-index"
+
+	# directory request missing a trailing slash: redirected so relative
+	# links in the served/generated content stay correct
+	txreq -url "/withhtml"
+	rxresp
+	expect resp.status == 301
+	expect resp.http.location == "/withhtml/"
+
+	# trailing slash redirect preserves the query string
+	txreq -url "/withhtml?v=1"
+	rxresp
+	expect resp.status == 301
+	expect resp.http.location == "/withhtml/?v=1"
+
+	# no candidate present, autoindex off (default): 403, matches nginx
+	txreq -url "/empty/"
+	rxresp
+	expect resp.status == 403
+
+	# a directory named like a host, requested with a leading "//", must not
+	# turn into a scheme-relative Location a browser resolves as an
+	# off-site redirect
+	txreq -url "//evil.example.com"
+	rxresp
+	expect resp.status == 301
+	expect resp.http.location == "/evil.example.com/"
+
+	# a percent-encoded path resolves to the same file a literal one would
+	txreq -url "/has%20space.txt"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "space"
+
+	# malformed percent-encoding is rejected rather than passed through
+	txreq -url "/has%2space.txt"
+	rxresp
+	expect resp.status == 400
+
+	# a trailing slash only makes sense for a directory
+	txreq -url "/withhtml/index.html/"
+	rxresp
+	expect resp.status == 404
+} -run
