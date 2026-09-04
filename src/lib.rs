@@ -309,16 +309,11 @@ impl FileBackend {
         None
     }
 
-    // no index file matched: render a directory listing if autoindex is on
-    // (and this build has the renderer), otherwise 403 -- matches nginx.
-    // Without the `autoindex` feature, every parameter below the first two
-    // (including `self`) goes unused, and the function never actually
-    // fails (the renderer that would use them, and the fallible header
-    // calls, aren't compiled in)
-    #[cfg_attr(
-        not(feature = "autoindex"),
-        allow(unused_variables, clippy::unnecessary_wraps, clippy::unused_self)
-    )]
+    // no index file matched: render a directory listing if autoindex is on,
+    // otherwise 403 -- matches nginx. Compiled out entirely without the
+    // `autoindex` feature; the call site falls back to the 403 directly
+    // instead (see get_response)
+    #[cfg(feature = "autoindex")]
     fn serve_missing_index(
         &self,
         ctx: &mut Ctx,
@@ -327,9 +322,6 @@ impl FileBackend {
         dir_path: &std::path::Path,
         is_get: bool,
     ) -> VclResult<Option<FileTransfer>> {
-        // no-op without the `autoindex` feature: falls through to the 403
-        // below, since there's no renderer built in
-        #[cfg(feature = "autoindex")]
         if self.autoindex.load(Ordering::Relaxed) {
             let bereq = ctx
                 .http_bereq
@@ -383,8 +375,8 @@ impl FileBackend {
                 }
             }
         }
-        // no index file, and autoindex is off (or compiled out): matches
-        // nginx's behavior for the same case
+        // index_file candidates were configured but none matched, and
+        // autoindex is off: matches nginx's behavior for the same case
         let beresp = ctx
             .http_beresp
             .as_mut()
@@ -477,7 +469,7 @@ impl VclBackend<FileTransfer> for FileBackend {
         // (inside or outside the root, we don't distinguish) makes the
         // corresponding open_file/sub_dir call fail instead of following it
         let f = match &self.root_dir {
-            Some(root_dir) => open_through_dir(root_dir, &segments),
+            Some(root_dir) => walk_segments(root_dir, &segments, open_regular),
             None => open_regular_at(&path),
         };
         let mut f = match f {
@@ -543,27 +535,39 @@ impl VclBackend<FileTransfer> for FileBackend {
             // below and, if that finds nothing, by the listing renderer --
             // instead of walking from root again for each index_file
             // candidate and a third time for the listing
-            let dir = if let Some(root_dir) = &self.root_dir {
-                let Ok(dir) = open_dir_through(root_dir, &segments) else {
-                    // metadata.is_dir() was just true a moment ago; anything
-                    // but a rare race means this can't fail, but if it does,
-                    // treat it like any other fs error
-                    beresp.set_status(403);
-                    return Ok(None);
-                };
-                Some(dir)
-            } else {
-                None
+            let Ok(dir) = self
+                .root_dir
+                .as_ref()
+                .map(|root_dir| walk_segments(root_dir, &segments, |d, s| d.sub_dir(s)))
+                .transpose()
+            else {
+                // metadata.is_dir() was just true a moment ago; anything but
+                // a rare race means this can't fail, but if it does, treat
+                // it like any other fs error
+                beresp.set_status(403);
+                return Ok(None);
             };
 
-            if let Some((idx_f, idx_meta, idx_path)) = self.find_index_file(dir.as_ref(), &path) {
-                // an index file was found: fall through to the normal
-                // file-serving logic below, as if it had been requested directly
-                f = idx_f;
-                metadata = idx_meta;
-                path = idx_path;
-            } else {
-                return self.serve_missing_index(ctx, dir.as_ref(), &segments, &path, is_get);
+            match self.find_index_file(dir.as_ref(), &path) {
+                Some((idx_f, idx_meta, idx_path)) => {
+                    // an index file was found: fall through to the normal
+                    // file-serving logic below, as if it had been requested
+                    // directly
+                    f = idx_f;
+                    metadata = idx_meta;
+                    path = idx_path;
+                }
+                #[cfg(feature = "autoindex")]
+                None => {
+                    return self.serve_missing_index(ctx, dir.as_ref(), &segments, &path, is_get);
+                }
+                // no renderer compiled in: same outcome serve_missing_index
+                // would reach anyway, without needing the function at all
+                #[cfg(not(feature = "autoindex"))]
+                None => {
+                    beresp.set_status(403);
+                    return Ok(None);
+                }
             }
         } else if url_path.ends_with('/') {
             // a trailing slash only makes sense for a directory; matches nginx
@@ -1114,7 +1118,7 @@ fn percent_decode_segment(s: &str) -> Result<String, Box<dyn Error>> {
 // lookup should use, clamping ".." (encoded or not) so it can never walk
 // above the root: this is purely lexical (no filesystem access, no link
 // resolution), so it says nothing about symlinks -- that's handled
-// separately, see open_through_dir(). Segments are decoded here (rather
+// separately, via walk_segments()/open_regular(). Segments are decoded here (rather
 // than left percent-encoded) so a link this vmod generates in a directory
 // listing resolves to the same file it was generated from.
 fn clamp_segments(url: &str) -> Result<Vec<String>, Box<dyn Error>> {
@@ -1267,18 +1271,6 @@ fn open_regular_at(path: &std::path::Path) -> std::io::Result<File> {
         return Err(std::io::ErrorKind::PermissionDenied.into());
     }
     File::open(path)
-}
-
-fn open_through_dir(root: &Dir, segments: &[String]) -> std::io::Result<File> {
-    walk_segments(root, segments, open_regular)
-}
-
-// walks to the directory `segments` resolves to and opens *it*, so a
-// directory request can look up index_file candidates and/or render a
-// listing relative to one shared handle instead of walking from root again
-// for each candidate and a third time for the listing
-fn open_dir_through(root: &Dir, segments: &[String]) -> std::io::Result<Dir> {
-    walk_segments(root, segments, |d, s| d.sub_dir(s))
 }
 
 fn generate_etag(metadata: &Metadata, modified: Option<SystemTime>) -> String {
