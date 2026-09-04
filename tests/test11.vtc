@@ -21,6 +21,16 @@ shell {
 	mkfifo ${tmpdir}/afifo
 	mkdir -p ${tmpdir}/fifoindex
 	mkfifo ${tmpdir}/fifoindex/index.html
+
+	# an index_file candidate that's itself a directory must be skipped,
+	# falling through to the next candidate
+	mkdir -p ${tmpdir}/dirindex/index.html
+	printf %s "htm-index-wins" > ${tmpdir}/dirindex/index.htm
+
+	# index_file() under follow_links=true, exercising the std::fs
+	# (non-openat) candidate-lookup path
+	mkdir -p ${tmpdir}/withindex_following
+	printf %s "following-index" > ${tmpdir}/withindex_following/index.html
 }
 
 varnish v1 -vcl {
@@ -32,10 +42,17 @@ varnish v1 -vcl {
 		new www = fileserver.root("${tmpdir}");
 		www.index_file("index.html");
 		www.index_file("index.htm");
+
+		new following = fileserver.root("${tmpdir}", follow_links = true);
+		following.index_file("index.html");
 	}
 
 	sub vcl_recv {
-		set req.backend_hint = www.backend();
+		if (req.http.which == "following") {
+			set req.backend_hint = following.backend();
+		} else {
+			set req.backend_hint = www.backend();
+		}
 		return (pass);
 	}
 } -start
@@ -107,4 +124,25 @@ client c1 {
 	txreq -url "/fifoindex/"
 	rxresp
 	expect resp.status == 403
+
+	# a regular file used as an intermediate path segment can't possibly
+	# be a directory -- treat it as "not found" (ENOTDIR), not a hard
+	# backend error
+	txreq -url "/withhtml/index.html/oops"
+	rxresp
+	expect resp.status == 404
+
+	# an index_file candidate that's itself a directory is skipped,
+	# falling through to the next candidate
+	txreq -url "/dirindex/"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "htm-index-wins"
+
+	# index_file() also works under follow_links=true, which resolves
+	# candidates via plain std::fs (open_regular_at) rather than openat
+	txreq -url "/withindex_following/" -hdr "which: following"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "following-index"
 } -run

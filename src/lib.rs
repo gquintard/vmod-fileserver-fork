@@ -10,7 +10,9 @@ use std::io::{BufRead, BufReader, Read, Take};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "autoindex")]
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
@@ -163,7 +165,19 @@ mod fileserver {
         /// If `true`, a request that resolves to a directory with no
         /// matching `index_file` gets a generated directory listing instead
         /// of a 403. The format (HTML, JSON, or YAML) is chosen from the
-        /// request's `accept` header, defaulting to HTML.
+        /// request's `accept` header, defaulting to HTML. A directory with
+        /// more than 10,000 entries is truncated (an `x-fileserver-truncated:
+        /// true` response header is added when this happens) -- the surviving
+        /// entries are an arbitrary subset in directory order, not
+        /// necessarily the first 10,000 alphabetically, since sorting only
+        /// happens after the cap is applied.
+        ///
+        /// The listing is never cached (`cache-control: no-store`), since it
+        /// can vary per-client (by `accept`) without bound. If unambiguous
+        /// machine consumption matters, prefer the JSON format: YAML follows
+        /// the YAML 1.2 Core Schema, so a filename like `no`/`yes`/`on`/`off`
+        /// is emitted unquoted and a YAML *1.1* parser (e.g. Python's
+        /// `yaml.safe_load`) will misread it as a boolean, not a string.
         ///
         /// Defaults to `false`. Has no effect if this build of the vmod was
         /// compiled without the `autoindex` Cargo feature (a directory with
@@ -181,9 +195,14 @@ mod fileserver {
         /// If `true` (default), file sizes in a generated HTML directory
         /// listing are shown in a human-friendly form (e.g. `4.2K`), with
         /// the exact byte count available as a tooltip. If `false`, the
-        /// exact byte count is shown directly.
+        /// exact byte count is shown directly, with no unit suffix (e.g.
+        /// `4096`), matching nginx's `autoindex_exact_size` behavior.
         ///
-        /// Only affects the HTML format. Can only be called from `vcl_init`.
+        /// Only affects the HTML format (JSON/YAML always report the exact
+        /// byte count, machine-readably). Has no effect if this build of
+        /// the vmod was compiled without the `autoindex` Cargo feature.
+        ///
+        /// Can only be called from `vcl_init`.
         #[restrict(vcl_init)]
         pub fn autoindex_human_size(&self, on: bool) {
             self.backend
@@ -199,7 +218,11 @@ mod fileserver {
         /// Either way the visible date uses the same format as nginx's own
         /// autoindex (e.g. `02-Sep-2026 17:18`).
         ///
-        /// Only affects the HTML format. Can only be called from `vcl_init`.
+        /// Only affects the HTML format (JSON/YAML always report the exact
+        /// timestamp, machine-readably). Has no effect if this build of the
+        /// vmod was compiled without the `autoindex` Cargo feature.
+        ///
+        /// Can only be called from `vcl_init`.
         #[restrict(vcl_init)]
         pub fn autoindex_human_dates(&self, on: bool) {
             self.backend
@@ -210,21 +233,26 @@ mod fileserver {
 
         /// Return the Varnish backend serving files under this object's root.
         ///
-        /// - Only `GET` and `HEAD` requests are served; anything else gets a 405.
+        /// - Only `GET` and `HEAD` requests are served; anything else gets a
+        ///   405. A non-UTF-8 request URL gets a 400; a non-UTF-8 method
+        ///   isn't `GET`/`HEAD` and so gets a 405.
         /// - The request URL's query string, if any, is ignored when
         ///   resolving the file on disk. The path itself is percent-decoded;
         ///   a malformed or unsafe percent-encoding gets a 400.
-        /// - A missing file returns 404; an unreadable one returns 403.
+        /// - A missing file returns 404; an unreadable one returns 403; a
+        ///   FIFO, socket, or device is never opened and also returns 403.
         /// - Unless `follow_links` was set on the constructor, a request
-        ///   that hits a symlink anywhere in its path fails instead of
-        ///   being served.
+        ///   that hits a symlink anywhere in its path fails (503) instead
+        ///   of being served.
         /// - A request that resolves to a directory gets a 301 (adding a
         ///   trailing slash) if it's missing one, otherwise the first
         ///   matching `index_file`, a generated listing (if `autoindex` is
         ///   on), or a 403. A trailing slash on a regular file gets a 404.
         /// - `etag`/`if-none-match` and `last-modified`/`if-modified-since`
-        ///   are supported. `etag` is derived from the file's inode, size,
-        ///   and modification time (if available).
+        ///   are supported for regular files (a generated listing carries
+        ///   neither, but does carry `vary: accept` and is never cached,
+        ///   since it can vary per-client without bound). `etag` is derived
+        ///   from the file's inode, size, and modification time (if available).
         pub unsafe fn backend(&self, _ctx: &Ctx) -> VCL_BACKEND {
             unsafe { self.backend.as_ref().vcl_ptr() }
         }
@@ -253,20 +281,34 @@ struct FileBackend {
 }
 
 impl FileBackend {
+    // `autoindex` is always false without the `autoindex` feature, since
+    // the renderer it would enable isn't compiled in either way -- this is
+    // used both by the fast-path check below (skip opening the directory
+    // at all when there's nothing to do) and by serve_missing_index()
+    #[cfg(feature = "autoindex")]
+    fn autoindex_enabled(&self) -> bool {
+        self.autoindex.load(Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "autoindex"))]
+    #[allow(clippy::unused_self)]
+    fn autoindex_enabled(&self) -> bool {
+        false
+    }
+
     // looks for the first configured index_file that exists as a regular
-    // file (not a directory) directly inside the directory `segments`
-    // resolves to
+    // file (not a directory) directly inside `dir` (the directory
+    // `segments` resolves to, already opened once by the caller -- so
+    // each candidate is one open relative to it, not a fresh walk from
+    // root per candidate)
     fn find_index_file(
         &self,
-        segments: &[String],
+        dir: Option<&Dir>,
         dir_path: &std::path::Path,
     ) -> Option<(File, Metadata, PathBuf)> {
         let index_files = self.index_files.read().expect("index_files lock poisoned");
         for name in index_files.iter() {
-            let mut candidate_segments = segments.to_vec();
-            candidate_segments.push(name.clone());
-            let candidate = match &self.root_dir {
-                Some(root_dir) => open_through_dir(root_dir, &candidate_segments),
+            let candidate = match dir {
+                Some(dir) => open_regular(dir, name),
                 None => open_regular_at(&dir_path.join(name)),
             };
             let Ok(candidate_f) = candidate else {
@@ -286,56 +328,74 @@ impl FileBackend {
     // no index file matched: render a directory listing if autoindex is on
     // (and this build has the renderer), otherwise 403 -- matches nginx.
     // Without the `autoindex` feature, every parameter below the first two
-    // goes unused, and the function never actually fails (the renderer
-    // that would use them, and the fallible header calls, aren't compiled in)
+    // (including `self`) goes unused, and the function never actually
+    // fails (the renderer that would use them, and the fallible header
+    // calls, aren't compiled in)
     #[cfg_attr(
         not(feature = "autoindex"),
-        allow(unused_variables, clippy::unnecessary_wraps)
+        allow(unused_variables, clippy::unnecessary_wraps, clippy::unused_self)
     )]
     fn serve_missing_index(
         &self,
         ctx: &mut Ctx,
+        dir: Option<&Dir>,
         segments: &[String],
         dir_path: &std::path::Path,
         is_get: bool,
     ) -> VclResult<Option<FileTransfer>> {
-        if self.autoindex.load(Ordering::Relaxed) {
-            // no-op without the `autoindex` feature: falls through to the
-            // 403 below, since there's no renderer built in
-            #[cfg(feature = "autoindex")]
-            {
-                let bereq = ctx
-                    .http_bereq
-                    .as_ref()
-                    .expect("bereq is set during a backend fetch");
-                let accept = bereq.header("accept").and_then(sob_helper);
-                let display_path = normalized_url_path(segments);
-                match self.render_autoindex(&display_path, segments, dir_path, accept) {
-                    Ok((body, content_type)) => {
-                        let beresp = ctx
-                            .http_beresp
-                            .as_mut()
-                            .expect("beresp is set during a backend fetch");
-                        beresp.set_status(200);
-                        // the body depends on the accept header
-                        beresp.set_header("vary", "accept")?;
-                        beresp.set_header("content-length", &format!("{}", body.len()))?;
-                        beresp.set_header("content-type", content_type)?;
-                        let transfer = is_get.then(|| FileTransfer::Mem(Cursor::new(body)));
-                        return Ok(transfer);
+        // no-op without the `autoindex` feature: falls through to the 403
+        // below, since there's no renderer built in
+        #[cfg(feature = "autoindex")]
+        if self.autoindex_enabled() {
+            let bereq = ctx
+                .http_bereq
+                .as_ref()
+                .expect("bereq is set during a backend fetch");
+            let accept = bereq.header("accept").and_then(sob_helper);
+            let display_path = decoded_url_path(segments);
+            match self.render_autoindex(&display_path, dir, dir_path, accept) {
+                Ok((body, content_type, truncated)) => {
+                    let beresp = ctx
+                        .http_beresp
+                        .as_mut()
+                        .expect("beresp is set during a backend fetch");
+                    beresp.set_status(200);
+                    // the body depends on the accept header, but caching
+                    // per distinct accept value is a foot-gun: a client
+                    // can send an unbounded number of distinct accept
+                    // values, and each one becomes a separate cached
+                    // variant piling onto the *same* object (Varnish
+                    // compares Vary-listed header values verbatim, not
+                    // normalized) -- an attacker could force thousands
+                    // of variants onto one URL, fragmenting cache
+                    // storage and serializing lookups on that object.
+                    // Generated listings are cheap enough to regenerate
+                    // that it's not worth that risk: never cache them
+                    beresp.set_header("vary", "accept")?;
+                    beresp.set_header("cache-control", "no-store, max-age=0")?;
+                    beresp.set_header("content-length", &format!("{}", body.len()))?;
+                    beresp.set_header("content-type", content_type)?;
+                    if truncated {
+                        // MAX_LISTING_ENTRIES was hit: say so, since none of
+                        // the three formats otherwise indicate the list is
+                        // incomplete (a machine consumer can't tell from
+                        // the body alone that entries are missing)
+                        beresp.set_header("x-fileserver-truncated", "true")?;
                     }
-                    Err(e) => {
-                        ctx.log(
-                            LogTag::Error,
-                            format!("fileserver: could not generate a directory listing: {e}"),
-                        );
-                        let beresp = ctx
-                            .http_beresp
-                            .as_mut()
-                            .expect("beresp is set during a backend fetch");
-                        beresp.set_status(403);
-                        return Ok(None);
-                    }
+                    let transfer = is_get.then(|| FileTransfer::Mem(Cursor::new(body)));
+                    return Ok(transfer);
+                }
+                Err(e) => {
+                    ctx.log(
+                        LogTag::Error,
+                        format!("fileserver: could not generate a directory listing: {e}"),
+                    );
+                    let beresp = ctx
+                        .http_beresp
+                        .as_mut()
+                        .expect("beresp is set during a backend fetch");
+                    beresp.set_status(403);
+                    return Ok(None);
                 }
             }
         }
@@ -438,7 +498,16 @@ impl VclBackend<FileTransfer> for FileBackend {
         };
         let mut f = match f {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // NotADirectory: a path segment expected to be a directory
+            // (e.g. the "foo.txt" in "/foo.txt/bar") turned out to be a
+            // regular file -- there's nothing there either way, so treat
+            // it the same as NotFound rather than a hard backend error
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
                 beresp.set_status(404);
                 return Ok(None);
             }
@@ -471,14 +540,46 @@ impl VclBackend<FileTransfer> for FileBackend {
                 return Ok(None);
             }
 
-            if let Some((idx_f, idx_meta, idx_path)) = self.find_index_file(&segments, &path) {
+            // the common case: nothing configured means nothing to look up
+            // -- skip opening the directory at all rather than walking to
+            // it just to immediately discover there's no index_file to try
+            // and no listing to render
+            if self
+                .index_files
+                .read()
+                .expect("index_files lock poisoned")
+                .is_empty()
+                && !self.autoindex_enabled()
+            {
+                beresp.set_status(403);
+                return Ok(None);
+            }
+
+            // resolve the directory once -- shared by the index_file search
+            // below and, if that finds nothing, by the listing renderer --
+            // instead of walking from root again for each index_file
+            // candidate and a third time for the listing
+            let dir = if let Some(root_dir) = &self.root_dir {
+                let Ok(dir) = open_dir_through(root_dir, &segments) else {
+                    // metadata.is_dir() was just true a moment ago; anything
+                    // but a rare race means this can't fail, but if it does,
+                    // treat it like any other fs error
+                    beresp.set_status(403);
+                    return Ok(None);
+                };
+                Some(dir)
+            } else {
+                None
+            };
+
+            if let Some((idx_f, idx_meta, idx_path)) = self.find_index_file(dir.as_ref(), &path) {
                 // an index file was found: fall through to the normal
                 // file-serving logic below, as if it had been requested directly
                 f = idx_f;
                 metadata = idx_meta;
                 path = idx_path;
             } else {
-                return self.serve_missing_index(ctx, &segments, &path, is_get);
+                return self.serve_missing_index(ctx, dir.as_ref(), &segments, &path, is_get);
             }
         } else if url_path.ends_with('/') {
             // a trailing slash only makes sense for a directory; matches nginx
@@ -593,6 +694,13 @@ impl VclResponse for FileTransfer {
     }
 }
 
+// hard cap on how many raw directory entries a single generated listing
+// examines (not how many survive the dotfile/non-UTF-8/symlink filters --
+// counting only survivors would let a directory dominated by filtered-out
+// names force a full, uncapped directory scan on every request)
+#[cfg(feature = "autoindex")]
+const MAX_LISTING_ENTRIES: usize = 10_000;
+
 #[cfg(feature = "autoindex")]
 #[derive(serde::Serialize)]
 struct AutoindexEntry {
@@ -650,20 +758,28 @@ impl FileBackend {
     fn render_autoindex(
         &self,
         url_path: &str,
-        segments: &[String],
+        dir: Option<&Dir>,
         dir_path: &std::path::Path,
         accept: Option<&str>,
-    ) -> Result<(Vec<u8>, &'static str), Box<dyn Error>> {
+    ) -> Result<(Vec<u8>, &'static str, bool), Box<dyn Error>> {
         let mut entries = Vec::new();
-        match &self.root_dir {
-            Some(root_dir) => {
-                // walk to the directory the same symlink-safe way as everywhere
-                // else in this file, then list it relative to that handle
-                let dir = open_dir_through(root_dir, segments)?;
+        let mut truncated = false;
+        // counts every raw entry examined, not just ones that survive the
+        // dotfile/non-UTF-8/symlink filters below -- capping only survivors
+        // would let a directory dominated by filtered-out names force a
+        // full, uncapped scan (unbounded CPU/syscalls) on every request
+        let mut seen: usize = 0;
+        match dir {
+            Some(dir) => {
                 // NOT dir.list_self(): `dir` is opened with O_PATH (like every
                 // Dir in the openat crate on Linux), and fdopendir() rejects
                 // O_PATH fds; list_dir(".") reopens a proper listable fd first
                 for entry in dir.list_dir(".")? {
+                    seen += 1;
+                    if seen > MAX_LISTING_ENTRIES {
+                        truncated = true;
+                        break;
+                    }
                     let entry = entry?;
                     // a non-UTF-8 name can't round-trip through this vmod's
                     // percent-decoded path scheme, so listing it would only
@@ -701,6 +817,11 @@ impl FileBackend {
                 // follow_links=true: dereference symlinks like everywhere
                 // else in this mode
                 for entry in std::fs::read_dir(dir_path)? {
+                    seen += 1;
+                    if seen > MAX_LISTING_ENTRIES {
+                        truncated = true;
+                        break;
+                    }
                     let entry = entry?;
                     let file_name = entry.file_name();
                     let Some(name) = file_name.to_str() else {
@@ -726,8 +847,32 @@ impl FileBackend {
         entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
 
         let format = pick_autoindex_format(accept);
+        // NOTE: unlike the HTML format (see html_escape/is_display_spoofing_char),
+        // `name` is NOT sanitized for JSON/YAML: both formats' string
+        // escaping is spec-compliant (JSON only mandates escaping 0x00-0x1F,
+        // `"`, and `\`; DEL and C1 controls, and Unicode bidi/invisible
+        // characters, are all valid unescaped JSON/YAML string content), so
+        // a properly-parsing consumer is unaffected either way. The risk is
+        // the same class as the YAML "Norway problem" noted below: someone
+        // piping the raw, unparsed response straight into a terminal. That's
+        // a much weaker threat model for a machine-consumption format than
+        // for HTML (which is directly rendered), so this vmod reports the
+        // real, unmodified name here rather than silently lossy-sanitizing
+        // data a machine consumer may need byte-exact
         let body = match format {
             AutoindexFormat::Json => serde_json::to_vec(&entries)?,
+            // NOTE: yaml_serde (like its ancestor serde_yaml) follows the
+            // YAML 1.2 Core Schema, so it only quotes `name` when *that*
+            // schema would otherwise misread it -- a filename like "no",
+            // "yes", "on", or "off" is emitted as a bare, unquoted scalar,
+            // which a YAML *1.1* parser (e.g. Python's `yaml.safe_load`,
+            // the "Norway problem") reads back as a bool, not a string.
+            // This is a known, longstanding disagreement between YAML
+            // spec versions in the wider ecosystem, not something this
+            // vmod can fix by itself without fragile post-processing of
+            // the emitted text -- consumers that need an unambiguous
+            // `name` field should request the JSON format instead, which
+            // always quotes strings
             AutoindexFormat::Yaml => yaml_serde::to_string(&entries)?.into_bytes(),
             AutoindexFormat::Html => render_autoindex_html(
                 url_path,
@@ -737,7 +882,7 @@ impl FileBackend {
             )
             .into_bytes(),
         };
-        Ok((body, format.content_type()))
+        Ok((body, format.content_type(), truncated))
     }
 }
 
@@ -818,12 +963,64 @@ fn render_autoindex_html(
     out
 }
 
+// escapes HTML-significant characters, and also neutralizes control
+// characters (ESC, other C0/C1 controls, DEL): a filename can legally
+// contain any byte except '/' and NUL, so without this, a name containing
+// e.g. an ANSI escape sequence would be echoed raw into the listing text --
+// harmless in a browser, but anyone viewing the raw response through a
+// terminal (`curl | less`, a log pipeline, etc.) gets arbitrary terminal
+// escape sequences executed (screen clears, hidden/spoofed text, and worse
+// in vulnerable terminal emulators). `char::is_control()` operates on
+// decoded Unicode scalar values, so this can't be confused by multi-byte
+// UTF-8 sequences the way a raw-byte filter could be
 #[cfg(feature = "autoindex")]
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            c if c.is_control() || is_display_spoofing_char(c) => out.push('\u{FFFD}'),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+// Unicode bidi-override and invisible/zero-width characters: `char::is_control()`
+// only covers the C0/C1/DEL control ranges, not these ("Cf", format) -- a
+// filename containing e.g. U+202E (RIGHT-TO-LEFT OVERRIDE) can make a
+// browser *display* "gpj.exe" as "exe.jpg" (the classic filename-spoofing
+// trick), and this works in any renderer, not just a terminal. Note this
+// only sanitizes the *visible* text (via html_escape): the href is built
+// separately from the real, unmodified name (see url_escape), so the link
+// still resolves to the actual file regardless
+#[cfg(feature = "autoindex")]
+// this list is a best-effort curated set, not a formal Unicode security
+// profile (see UTS #39 for that) -- it targets the characters commonly
+// used in real-world filename-spoofing/homograph attacks, not every
+// codepoint that is merely invisible or a formatting control
+fn is_display_spoofing_char(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' // soft hyphen
+        | '\u{061C}' // Arabic letter mark (the third implicit bidi mark, alongside LRM/RLM)
+        | '\u{180E}' // Mongolian vowel separator
+        | '\u{200B}'..='\u{200F}' // zero-width space/joiner/non-joiner, LRM/RLM
+        | '\u{2028}'..='\u{2029}' // line/paragraph separator: can force a line
+                                  // break even inside <pre>, fracturing the
+                                  // column-aligned listing layout
+        | '\u{202A}'..='\u{202E}' // LRE, RLE, PDF, LRO, RLO
+        | '\u{2060}'..='\u{2069}' // word joiner, invisible operators, isolates
+        | '\u{FE00}'..='\u{FE0F}' // variation selectors
+        | '\u{FEFF}' // BOM / zero-width no-break space
+        | '\u{E0001}' // language tag
+        | '\u{E0020}'..='\u{E007F}' // Unicode "tag" block: invisible when
+                                    // rendered, used for "ASCII smuggling"
+                                    // (hiding a second, invisible payload
+                                    // inside otherwise-plain-looking text)
+    )
 }
 
 #[cfg(feature = "autoindex")]
@@ -991,6 +1188,20 @@ fn normalized_url_path(segments: &[String]) -> String {
     out
 }
 
+// same as normalized_url_path(), but not percent-encoded: for display only
+// (e.g. a generated listing's "Index of ..." title), never for a Location
+// or an href -- entry names in that same listing are shown decoded, so the
+// title should match rather than showing e.g. "has%20space" next to "has space.txt"
+#[cfg(feature = "autoindex")]
+fn decoded_url_path(segments: &[String]) -> String {
+    let mut out = String::from("/");
+    for seg in segments {
+        out.push_str(seg);
+        out.push('/');
+    }
+    out
+}
+
 // percent-encode a filename for use in an href or URL path, so names with
 // spaces or other reserved characters don't produce a broken link; '/' is
 // left alone since it's only ever used here as a trailing directory marker
@@ -1040,7 +1251,16 @@ fn walk_segments<T>(
 // it's neither a regular file nor a directory: opening a FIFO with no
 // writer on the other end (or certain char/block devices) blocks the
 // calling thread forever, so a request for a FIFO placed in the root
-// (directly, or as an index_file candidate) must not reach open_file()
+// (directly, or as an index_file candidate) must not reach open_file().
+//
+// This is stat-then-open, not atomic: an attacker who can swap a regular
+// file for a FIFO at this exact path between the two calls could still win
+// the race. That requires write access to the docroot already, at which
+// point they have much stronger options than this race (e.g. serving
+// arbitrary content directly, or the pre-existing symlink-based risks this
+// vmod's follow_links=false default is meant to close) -- accepted rather
+// than adding raw non-blocking-open plumbing (the openat crate exposes no
+// flags API) for a threat model this vmod doesn't otherwise defend against.
 fn open_regular(dir: &Dir, name: &str) -> std::io::Result<File> {
     // a symlink is deliberately NOT rejected here: open_file()'s O_NOFOLLOW
     // already makes it fail on its own, with its own (tested) error kind --
@@ -1069,7 +1289,10 @@ fn open_through_dir(root: &Dir, segments: &[String]) -> std::io::Result<File> {
     walk_segments(root, segments, open_regular)
 }
 
-#[cfg(feature = "autoindex")]
+// walks to the directory `segments` resolves to and opens *it*, so a
+// directory request can look up index_file candidates and/or render a
+// listing relative to one shared handle instead of walking from root again
+// for each candidate and a third time for the listing
 fn open_dir_through(root: &Dir, segments: &[String]) -> std::io::Result<Dir> {
     walk_segments(root, segments, |d, s| d.sub_dir(s))
 }
@@ -1285,6 +1508,48 @@ mod tests {
             html_escape("<a href=\"x\">&amp;</a>"),
             "&lt;a href=&quot;x&quot;&gt;&amp;amp;&lt;/a&gt;"
         );
+    }
+
+    #[cfg(feature = "autoindex")]
+    #[test]
+    fn html_escape_neutralizes_control_characters() {
+        // a filename can legally contain an ESC byte (or other C0/C1
+        // controls); it must never reach the listing's HTML text raw, or
+        // anyone viewing the response through a terminal gets arbitrary
+        // escape sequences executed (screen clears, hidden text, etc.)
+        assert_eq!(
+            html_escape("evil\x1b[31mred\x1b[0m"),
+            "evil\u{FFFD}[31mred\u{FFFD}[0m"
+        );
+        // DEL and a C1 control (both still `char::is_control()`)
+        assert_eq!(html_escape("a\x7fb\u{0085}c"), "a\u{FFFD}b\u{FFFD}c");
+        // ordinary text is untouched
+        assert_eq!(html_escape("normal.txt"), "normal.txt");
+    }
+
+    #[cfg(feature = "autoindex")]
+    #[test]
+    fn html_escape_neutralizes_bidi_and_invisible_chars() {
+        // U+202E (RIGHT-TO-LEFT OVERRIDE) is not `char::is_control()`, but
+        // can make a browser *display* "gpj.exe" as "exe.jpg" -- the classic
+        // filename-spoofing trick, and it works in any renderer, not just a
+        // terminal, so it needs its own check alongside is_control()
+        assert_eq!(html_escape("evil\u{202e}gpj.exe"), "evil\u{FFFD}gpj.exe");
+        // zero-width space, used to hide/split text
+        assert_eq!(html_escape("a\u{200b}b"), "a\u{FFFD}b");
+        // a BOM inside a name
+        assert_eq!(html_escape("a\u{FEFF}b"), "a\u{FFFD}b");
+        // Arabic letter mark: the third implicit bidi mark, alongside LRM/RLM
+        assert_eq!(html_escape("a\u{061c}b"), "a\u{FFFD}b");
+        // line/paragraph separator: could fracture the <pre> column layout
+        assert_eq!(html_escape("a\u{2028}b\u{2029}c"), "a\u{FFFD}b\u{FFFD}c");
+        // soft hyphen, Mongolian vowel separator, a variation selector
+        assert_eq!(
+            html_escape("a\u{00ad}b\u{180e}c\u{fe0f}d"),
+            "a\u{FFFD}b\u{FFFD}c\u{FFFD}d"
+        );
+        // Unicode "tag" block: invisible "ASCII smuggling" characters
+        assert_eq!(html_escape("a\u{e0001}b\u{e0061}c"), "a\u{FFFD}b\u{FFFD}c");
     }
 
     #[cfg(feature = "autoindex")]

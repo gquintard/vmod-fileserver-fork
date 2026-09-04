@@ -15,6 +15,28 @@ shell {
 	# rendering or otherwise break the rest of the listing
 	badname=$(printf '\377\376bad.txt')
 	printf %s "unnameable" > "${tmpdir}/dir/$badname"
+
+	# HTML-significant characters in a filename must be escaped differently
+	# in the href (percent-encoded) vs. the link text (HTML-entity-escaped)
+	printf %s "html" > "${tmpdir}/dir/a<b>c&d.txt"
+
+	# a name at least NAME_COL (50) characters long exercises the HTML
+	# column-truncation arithmetic
+	printf %s "long" > ${tmpdir}/dir/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.txt
+
+	# a filename can legally contain an ESC byte (or other control chars);
+	# it must never reach the listing's HTML text raw, or anyone viewing
+	# the response through a terminal gets arbitrary escape sequences
+	# executed (screen clears, hidden/spoofed text, etc.)
+	escname=$(printf 'evil\033[31mred\033[0m.txt')
+	printf %s "ansi" > "${tmpdir}/dir/$escname"
+
+	# U+202E (RIGHT-TO-LEFT OVERRIDE) is a legal filename byte sequence
+	# that isn't a `char::is_control()` control character, but can still
+	# make a browser *display* the name misleadingly (e.g. disguising a
+	# ".exe" as a ".jpg") -- the classic filename-spoofing trick
+	rloname=$(printf 'evil\xe2\x80\xaegpj.exe')
+	printf %s "rlo" > "${tmpdir}/dir/$rloname"
 }
 
 varnish v1 -vcl {
@@ -66,6 +88,28 @@ client c1 {
 	rxresp
 	expect resp.status == 200
 	expect resp.body == "space"
+
+	# HTML-significant characters: percent-encoded in the href (attribute
+	# context), HTML-entity-escaped in the link text (text context)
+	txreq -url "/dir/"
+	rxresp
+	expect resp.body ~ {href="a%3Cb%3Ec%26d.txt"}
+	expect resp.body ~ {>a&lt;b&gt;c&amp;d.txt<}
+	# a name >= NAME_COL chars gets truncated (with the href still carrying
+	# the full name) so it can't break the listing's column alignment
+	expect resp.body ~ {href="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\.txt"}
+	expect resp.body ~ {>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\.\.&gt;<}
+	# a control character (e.g. an ANSI escape sequence) in a filename is
+	# percent-encoded in the href (so the link still resolves) but replaced
+	# in the link text -- it must never reach the raw HTML text, or anyone
+	# viewing the response through a terminal gets it executed
+	expect resp.body ~ {href="evil%1B%5B31mred%1B%5B0m\.txt"}
+	expect resp.body ~ {>evil�\[31mred�\[0m\.txt<}
+	# same idea for a Unicode bidi-override character: not a control
+	# character, but still neutralized in the link text (real bytes kept
+	# in the href) since it can visually disguise the name in any renderer
+	expect resp.body ~ {href="evil%E2%80%AEgpj\.exe"}
+	expect resp.body ~ {>evil�gpj\.exe<}
 
 	# follow_links=true: symlinks are followed and show up like any other
 	# entry, matching the rest of this vmod's behavior in that mode

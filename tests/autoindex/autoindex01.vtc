@@ -5,6 +5,7 @@ shell {
 	printf %s "hello" > ${tmpdir}/dir/afile.txt
 	mkdir -p ${tmpdir}/dir/asubdir
 	printf %s "space" > "${tmpdir}/dir/has space.txt"
+	mkdir -p "${tmpdir}/dir/sub dir"
 }
 
 varnish v1 -vcl {
@@ -41,6 +42,18 @@ client c1 {
 	# as-is in the link text
 	expect resp.body ~ {href="has%20space.txt"}
 	expect resp.body ~ {>has space.txt<}
+	# a generated listing is never cached: it can vary per-client (accept)
+	# without bound, so caching it risks unbounded cache-variant growth
+	expect resp.http.cache-control == "no-store, max-age=0"
+	# well under MAX_LISTING_ENTRIES: no truncation header
+	expect resp.http.x-fileserver-truncated == <undef>
+
+	# the title shows the decoded path, matching how entry names are shown
+	# (not the percent-encoded form used for hrefs/Location)
+	txreq -url "/dir/sub%20dir/"
+	rxresp
+	expect resp.status == 200
+	expect resp.body ~ {Index of /dir/sub dir/}
 
 	txreq -url "/dir/" -hdr "accept: text/plain, */*"
 	rxresp
