@@ -10,9 +10,7 @@ use std::io::{BufRead, BufReader, Read, Take};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::RwLock;
-use std::sync::atomic::AtomicBool;
-#[cfg(feature = "autoindex")]
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
@@ -281,20 +279,6 @@ struct FileBackend {
 }
 
 impl FileBackend {
-    // `autoindex` is always false without the `autoindex` feature, since
-    // the renderer it would enable isn't compiled in either way -- this is
-    // used both by the fast-path check below (skip opening the directory
-    // at all when there's nothing to do) and by serve_missing_index()
-    #[cfg(feature = "autoindex")]
-    fn autoindex_enabled(&self) -> bool {
-        self.autoindex.load(Ordering::Relaxed)
-    }
-    #[cfg(not(feature = "autoindex"))]
-    #[allow(clippy::unused_self)]
-    fn autoindex_enabled(&self) -> bool {
-        false
-    }
-
     // looks for the first configured index_file that exists as a regular
     // file (not a directory) directly inside `dir` (the directory
     // `segments` resolves to, already opened once by the caller -- so
@@ -346,7 +330,7 @@ impl FileBackend {
         // no-op without the `autoindex` feature: falls through to the 403
         // below, since there's no renderer built in
         #[cfg(feature = "autoindex")]
-        if self.autoindex_enabled() {
+        if self.autoindex.load(Ordering::Relaxed) {
             let bereq = ctx
                 .http_bereq
                 .as_ref()
@@ -549,7 +533,7 @@ impl VclBackend<FileTransfer> for FileBackend {
                 .read()
                 .expect("index_files lock poisoned")
                 .is_empty()
-                && !self.autoindex_enabled()
+                && !self.autoindex.load(Ordering::Relaxed)
             {
                 beresp.set_status(403);
                 return Ok(None);
