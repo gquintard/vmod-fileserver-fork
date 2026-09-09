@@ -12,9 +12,13 @@ shell {
 
 	# a non-UTF-8 name can't round-trip through percent-decoding, so it
 	# would only ever produce a dead link -- must be skipped, not crash
-	# rendering or otherwise break the rest of the listing
+	# rendering or otherwise break the rest of the listing. Best-effort:
+	# some filesystems (e.g. macOS's APFS) reject non-UTF-8 names outright,
+	# so there's nothing to exercise there -- no assertion below depends on
+	# this file existing, only on the rest of the listing still working
+	# fine alongside it when the filesystem allows it
 	badname=$(printf '\377\376bad.txt')
-	printf %s "unnameable" > "${tmpdir}/dir/$badname"
+	printf %s "unnameable" > "${tmpdir}/dir/$badname" 2>/dev/null || true
 
 	# HTML-significant characters in a filename must be escaped differently
 	# in the href (percent-encoded) vs. the link text (HTML-entity-escaped)
