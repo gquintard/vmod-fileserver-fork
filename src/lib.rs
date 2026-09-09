@@ -14,7 +14,7 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use openat::Dir;
 use varnish::run_vtc_tests;
 use varnish::vcl::{Backend, Ctx, LogTag, StrOrBytes, VclBackend, VclResponse, VclResult};
@@ -609,18 +609,12 @@ impl VclBackend<FileTransfer> for FileBackend {
         let etag = generate_etag(&metadata, modified_raw);
 
         // can we avoid sending a body?
-        let mut is_304 = false;
-        if let Some(inm) = bereq.header("if-none-match").and_then(sob_helper) {
-            if inm == etag || (inm.starts_with("W/") && inm[2..] == etag) {
-                is_304 = true;
-            }
-        } else if let Some(modified) = modified
-            && let Some(ims) = bereq.header("if-modified-since").and_then(sob_helper)
-            && let Ok(t) = DateTime::parse_from_rfc2822(ims)
-            && t >= modified
-        {
-            is_304 = true;
-        }
+        let is_304 = is_not_modified(
+            &etag,
+            modified,
+            bereq.header("if-none-match").and_then(sob_helper),
+            bereq.header("if-modified-since").and_then(sob_helper),
+        );
 
         beresp.set_proto("HTTP/1.1")?;
         let mut transfer = None;
@@ -1288,6 +1282,35 @@ fn open_regular(path: &std::path::Path) -> std::io::Result<File> {
     Ok(file)
 }
 
+// true if the request's if-none-match/if-modified-since means the client
+// already has the current version and can be sent 304 instead of a body.
+// `modified` is truncated to whole-second precision to match what
+// last-modified actually sends (RFC 7232 conditional headers are second-
+// granularity; comparing against the untruncated mtime would make a file
+// whose mtime has a non-zero sub-second part never 304, even when the
+// client correctly echoes back the exact last-modified value it was given)
+fn is_not_modified(
+    etag: &str,
+    modified: Option<DateTime<Utc>>,
+    inm: Option<&str>,
+    ims: Option<&str>,
+) -> bool {
+    if let Some(inm) = inm {
+        return inm == etag || (inm.starts_with("W/") && &inm[2..] == etag);
+    }
+    let Some(modified) = modified else {
+        return false;
+    };
+    let modified = modified.trunc_subsecs(0);
+    let Some(ims) = ims else {
+        return false;
+    };
+    let Ok(t) = DateTime::parse_from_rfc2822(ims) else {
+        return false;
+    };
+    t >= modified
+}
+
 fn generate_etag(metadata: &Metadata, modified: Option<SystemTime>) -> String {
     #[derive(Hash)]
     struct ShortMd {
@@ -1301,6 +1324,9 @@ fn generate_etag(metadata: &Metadata, modified: Option<SystemTime>) -> String {
         size: metadata.size(),
         modified,
     };
+    // SipHash-1-3 with fixed keys, deterministic across restarts but not
+    // collision-resistant -- fine here since an ETag is a cache-validation
+    // token, not a security boundary
     let mut h = DefaultHasher::new();
     smd.hash(&mut h);
     format!("\"{}\"", h.finish())
@@ -1585,6 +1611,51 @@ mod tests {
         assert!(matches!(
             pick_autoindex_format(Some("application/x-yaml")),
             super::AutoindexFormat::Yaml
+        ));
+    }
+
+    use super::is_not_modified;
+    use chrono::DateTime;
+
+    #[test]
+    fn is_not_modified_matches_etag() {
+        assert!(is_not_modified("\"abc\"", None, Some("\"abc\""), None));
+    }
+
+    #[test]
+    fn is_not_modified_matches_weak_etag() {
+        assert!(is_not_modified("\"abc\"", None, Some("W/\"abc\""), None));
+    }
+
+    #[test]
+    fn is_not_modified_mismatched_etag_no_ims() {
+        assert!(!is_not_modified("\"abc\"", None, Some("\"wrong\""), None));
+    }
+
+    #[test]
+    fn is_not_modified_ims_matches_after_truncating_subseconds() {
+        // the mtime has a non-zero sub-second component (as most real mtimes
+        // do), but last-modified only ever sends whole seconds -- a client
+        // correctly echoing back that exact (truncated) value must still 304
+        let modified = DateTime::from_timestamp(1_000, 500_000_000).unwrap();
+        let ims = DateTime::from_timestamp(1_000, 0).unwrap().to_rfc2822();
+        assert!(is_not_modified(
+            "\"etag\"",
+            Some(modified),
+            None,
+            Some(&ims)
+        ));
+    }
+
+    #[test]
+    fn is_not_modified_ims_older_than_modified() {
+        let modified = DateTime::from_timestamp(1_000, 0).unwrap();
+        let ims = DateTime::from_timestamp(999, 0).unwrap().to_rfc2822();
+        assert!(!is_not_modified(
+            "\"etag\"",
+            Some(modified),
+            None,
+            Some(&ims)
         ));
     }
 }
