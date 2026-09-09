@@ -8,6 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::io::{BufRead, BufReader, Read, Take};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::PathBuf;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -286,15 +287,15 @@ impl FileBackend {
     // root per candidate)
     fn find_index_file(
         &self,
-        dir: Option<&Dir>,
+        dir: &Dir,
         dir_path: &std::path::Path,
     ) -> Option<(File, Metadata, PathBuf)> {
         let index_files = self.index_files.read().expect("index_files lock poisoned");
+        // follow_links=true still opens relative to dir's fd -- only
+        // whether O_NOFOLLOW is set differs, and that's just a flag now
+        let follow = self.root_dir.is_none();
         for name in index_files.iter() {
-            let candidate = match dir {
-                Some(dir) => open_regular(dir, name),
-                None => open_regular_at(&dir_path.join(name)),
-            };
+            let candidate = open_regular_at(dir, name, follow);
             let Ok(candidate_f) = candidate else {
                 continue;
             };
@@ -317,9 +318,8 @@ impl FileBackend {
     fn serve_missing_index(
         &self,
         ctx: &mut Ctx,
-        dir: Option<&Dir>,
+        dir: &Dir,
         segments: &[String],
-        dir_path: &std::path::Path,
         is_get: bool,
     ) -> VclResult<Option<FileTransfer>> {
         if self.autoindex.load(Ordering::Relaxed) {
@@ -329,7 +329,7 @@ impl FileBackend {
                 .expect("bereq is set during a backend fetch");
             let accept = bereq.header("accept").and_then(sob_helper);
             let display_path = decoded_url_path(segments);
-            match self.render_autoindex(&display_path, dir, dir_path, accept) {
+            match self.render_autoindex(&display_path, dir, accept) {
                 Ok((body, content_type, truncated)) => {
                     let beresp = ctx
                         .http_beresp
@@ -469,8 +469,10 @@ impl VclBackend<FileTransfer> for FileBackend {
         // (inside or outside the root, we don't distinguish) makes the
         // corresponding open_file/sub_dir call fail instead of following it
         let f = match &self.root_dir {
-            Some(root_dir) => walk_segments(root_dir, &segments, open_regular),
-            None => open_regular_at(&path),
+            Some(root_dir) => {
+                walk_segments(root_dir, &segments, |d, s| open_regular_at(d, s, false))
+            }
+            None => open_regular(&path),
         };
         let mut f = match f {
             Ok(f) => f,
@@ -531,24 +533,26 @@ impl VclBackend<FileTransfer> for FileBackend {
                 return Ok(None);
             }
 
-            // resolve the directory once -- shared by the index_file search
-            // below and, if that finds nothing, by the listing renderer --
-            // instead of walking from root again for each index_file
-            // candidate and a third time for the listing
-            let Ok(dir) = self
-                .root_dir
-                .as_ref()
-                .map(|root_dir| walk_segments(root_dir, &segments, |d, s| d.sub_dir(s)))
-                .transpose()
-            else {
-                // metadata.is_dir() was just true a moment ago; anything but
-                // a rare race means this can't fail, but if it does, treat
-                // it like any other fs error
+            // dir gives find_index_file/render_autoindex a single handle to
+            // search candidates and list entries against (one hop per name,
+            // not a walk from root each time). It's obtained by reusing f's
+            // fd rather than reopening by path: f already points at this
+            // exact directory (opening a directory O_RDONLY succeeds), and
+            // a fresh reopen could resolve to something other than what
+            // metadata.is_dir() just checked, if the path changed
+            // underneath us in between. This works the same whether f came
+            // from the NOFOLLOW walk or the follow_links=true open: naming
+            // and listing entries never involves a follow/no-follow
+            // decision, only the per-entry lookups downstream do
+            //
+            // fstat on our own already-open fd failing is not a real-world
+            // case, but handle it like any other fs error
+            let Ok(dir) = (unsafe { Dir::from_raw_fd_checked(f.into_raw_fd()) }) else {
                 beresp.set_status(403);
                 return Ok(None);
             };
 
-            match self.find_index_file(dir.as_ref(), &path) {
+            match self.find_index_file(&dir, &path) {
                 Some((idx_f, idx_meta, idx_path)) => {
                     // an index file was found: fall through to the normal
                     // file-serving logic below, as if it had been requested
@@ -559,7 +563,7 @@ impl VclBackend<FileTransfer> for FileBackend {
                 }
                 #[cfg(feature = "autoindex")]
                 None => {
-                    return self.serve_missing_index(ctx, dir.as_ref(), &segments, &path, is_get);
+                    return self.serve_missing_index(ctx, &dir, &segments, is_get);
                 }
                 // no renderer compiled in: same outcome serve_missing_index
                 // would reach anyway, without needing the function at all
@@ -746,8 +750,7 @@ impl FileBackend {
     fn render_autoindex(
         &self,
         url_path: &str,
-        dir: Option<&Dir>,
-        dir_path: &std::path::Path,
+        dir: &Dir,
         accept: Option<&str>,
     ) -> Result<(Vec<u8>, &'static str, bool), Box<dyn Error>> {
         let mut entries = Vec::new();
@@ -757,79 +760,48 @@ impl FileBackend {
         // would let a directory dominated by filtered-out names force a
         // full, uncapped scan (unbounded CPU/syscalls) on every request
         let mut seen: usize = 0;
-        match dir {
-            Some(dir) => {
-                // NOT dir.list_self(): `dir` is opened with O_PATH (like every
-                // Dir in the openat crate on Linux), and fdopendir() rejects
-                // O_PATH fds; list_dir(".") reopens a proper listable fd first
-                for entry in dir.list_dir(".")? {
-                    seen += 1;
-                    if seen > MAX_LISTING_ENTRIES {
-                        truncated = true;
-                        break;
-                    }
-                    let entry = entry?;
-                    // a non-UTF-8 name can't round-trip through this vmod's
-                    // percent-decoded path scheme, so listing it would only
-                    // ever produce a permanently broken href -- skip it
-                    // rather than advertise a dead link
-                    let Some(name) = entry.file_name().to_str() else {
-                        continue;
-                    };
-                    let name = name.to_string();
-                    // nginx-style: don't advertise dotfiles (.git, .htpasswd, ...)
-                    if name.starts_with('.') {
-                        continue;
-                    }
-                    // fstatat(AT_SYMLINK_NOFOLLOW) -- this *stats*, it never
-                    // opens the entry, so a FIFO with no writer can't hang
-                    // the request, and an unreadable-but-listable file doesn't
-                    // vanish from the listing
-                    let Ok(md) = dir.metadata(entry.file_name()) else {
-                        continue;
-                    };
-                    // reports the symlink's own metadata rather than
-                    // following it, so skip it here, matching follow_links=false
-                    if md.simple_type() == openat::SimpleType::Symlink {
-                        continue;
-                    }
-                    entries.push(AutoindexEntry {
-                        name,
-                        is_dir: md.is_dir(),
-                        size: (!md.is_dir()).then_some(md.len()),
-                        modified: openat_modified(&md).map(DateTime::from),
-                    });
-                }
+        // NOT dir.list_self(): `dir` is opened with O_PATH (like every
+        // Dir in the openat crate on Linux), and fdopendir() rejects
+        // O_PATH fds; list_dir(".") reopens a proper listable fd first.
+        // Naming entries never involves a follow/no-follow decision, so
+        // this part doesn't need to branch on follow_links
+        let follow = self.root_dir.is_none();
+        for entry in dir.list_dir(".")? {
+            seen += 1;
+            if seen > MAX_LISTING_ENTRIES {
+                truncated = true;
+                break;
             }
-            None => {
-                // follow_links=true: dereference symlinks like everywhere
-                // else in this mode
-                for entry in std::fs::read_dir(dir_path)? {
-                    seen += 1;
-                    if seen > MAX_LISTING_ENTRIES {
-                        truncated = true;
-                        break;
-                    }
-                    let entry = entry?;
-                    let file_name = entry.file_name();
-                    let Some(name) = file_name.to_str() else {
-                        continue;
-                    };
-                    let name = name.to_string();
-                    if name.starts_with('.') {
-                        continue;
-                    }
-                    let Ok(md) = std::fs::metadata(entry.path()) else {
-                        continue;
-                    };
-                    entries.push(AutoindexEntry {
-                        name,
-                        is_dir: md.is_dir(),
-                        size: (!md.is_dir()).then_some(md.len()),
-                        modified: md.modified().ok().map(DateTime::from),
-                    });
-                }
+            let entry = entry?;
+            // a non-UTF-8 name can't round-trip through this vmod's
+            // percent-decoded path scheme, so listing it would only
+            // ever produce a permanently broken href -- skip it
+            // rather than advertise a dead link
+            let Some(name) = entry.file_name().to_str() else {
+                continue;
+            };
+            let name = name.to_string();
+            // nginx-style: don't advertise dotfiles (.git, .htpasswd, ...)
+            if name.starts_with('.') {
+                continue;
             }
+            let Ok(st) = fstatat(dir, entry.file_name(), follow) else {
+                continue;
+            };
+            // !follow reports the symlink's own metadata rather than
+            // following it, so skip it here, matching follow_links=false;
+            // follow=true already resolved past any symlink in fstatat
+            // itself, so this never trips in that mode
+            if !follow && st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                continue;
+            }
+            let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
+            entries.push(AutoindexEntry {
+                name,
+                is_dir,
+                size: (!is_dir).then_some(st.st_size.cast_unsigned()),
+                modified: stat_modified(&st).map(DateTime::from),
+            });
         }
         // nginx-style: directories before files, each group alphabetical
         entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
@@ -1034,14 +1006,32 @@ fn human_readable_size(bytes: u64) -> String {
 // crate standardizes them), so this is portable across this vmod's
 // supported platforms
 #[cfg(feature = "autoindex")]
-fn openat_modified(md: &openat::Metadata) -> Option<SystemTime> {
-    let stat = md.stat();
+fn stat_modified(stat: &libc::stat) -> Option<SystemTime> {
     let secs = u64::try_from(stat.st_mtime).ok()?;
     let nsec = u32::try_from(stat.st_mtime_nsec).ok()?;
     if nsec >= 1_000_000_000 {
         return None;
     }
     Some(SystemTime::UNIX_EPOCH + std::time::Duration::new(secs, nsec))
+}
+
+// fstatat relative to dir's fd, toggling AT_SYMLINK_NOFOLLOW via `follow`
+// -- same idea as open_regular_at()'s O_NOFOLLOW: follow/no-follow is
+// just a flag on the syscall, not a different code path. This *stats*,
+// it never opens the entry, so a FIFO with no writer can't hang the
+// request, and an unreadable-but-listable file doesn't vanish from the
+// listing
+#[cfg(feature = "autoindex")]
+fn fstatat(dir: &Dir, name: &std::ffi::OsStr, follow: bool) -> std::io::Result<libc::stat> {
+    let cname = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(name))
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let res = unsafe { libc::fstatat(dir.as_raw_fd(), cname.as_ptr(), &raw mut stat, flags) };
+    if res < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(stat)
 }
 
 // index_file() candidates must be a bare filename: no subdirectories, no
@@ -1118,7 +1108,7 @@ fn percent_decode_segment(s: &str) -> Result<String, Box<dyn Error>> {
 // lookup should use, clamping ".." (encoded or not) so it can never walk
 // above the root: this is purely lexical (no filesystem access, no link
 // resolution), so it says nothing about symlinks -- that's handled
-// separately, via walk_segments()/open_regular(). Segments are decoded here (rather
+// separately, via walk_segments()/open_regular_at(). Segments are decoded here (rather
 // than left percent-encoded) so a link this vmod generates in a directory
 // listing resolves to the same file it was generated from.
 fn clamp_segments(url: &str) -> Result<Vec<String>, Box<dyn Error>> {
@@ -1235,42 +1225,65 @@ fn walk_segments<T>(
     }
 }
 
-// stats `name` first (fstatat, never blocks) and refuses to open it if
-// it's neither a regular file nor a directory: opening a FIFO with no
-// writer on the other end (or certain char/block devices) blocks the
-// calling thread forever, so a request for a FIFO placed in the root
-// (directly, or as an index_file candidate) must not reach open_file().
-//
-// This is stat-then-open, not atomic: an attacker who can swap a regular
-// file for a FIFO at this exact path between the two calls could still win
-// the race. That requires write access to the docroot already, at which
-// point they have much stronger options than this race (e.g. serving
-// arbitrary content directly, or the pre-existing symlink-based risks this
-// vmod's follow_links=false default is meant to close) -- accepted rather
-// than adding raw non-blocking-open plumbing (the openat crate exposes no
-// flags API) for a threat model this vmod doesn't otherwise defend against.
-fn open_regular(dir: &Dir, name: &str) -> std::io::Result<File> {
-    // a symlink is deliberately NOT rejected here: open_file()'s O_NOFOLLOW
-    // already makes it fail on its own, with its own (tested) error kind --
-    // this check only needs to keep FIFOs/sockets/devices from being opened
-    if let Ok(md) = dir.metadata(name)
-        && md.simple_type() == openat::SimpleType::Other
-    {
+// opens `name` with O_NONBLOCK (matching nginx's ngx_open_and_stat_file:
+// verified against a real nginx via strace, it does exactly this), then
+// fstats the fd we actually opened and refuses anything that's neither a
+// regular file nor a directory: opening a FIFO with no writer on the
+// other end (or certain char/block devices) blocks the calling thread
+// forever without O_NONBLOCK, so a request for a FIFO placed in the root
+// (directly, or as an index_file candidate) must not reach a blocking
+// open. O_NONBLOCK has no effect on a regular file's later reads, so
+// there's no need to clear it once we know what we've got. Checking the
+// type via the fd we're about to use (rather than a separate stat-by-name
+// call first) also closes the TOCTOU a stat-then-open sequence would have
+// between the two: this is the actual file we open, not whatever a
+// second, later lookup of the same name happens to find
+fn open_regular_at(dir: &Dir, name: &str, follow: bool) -> std::io::Result<File> {
+    let cname = std::ffi::CString::new(name)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // when !follow, a symlink is deliberately NOT rejected here: O_NOFOLLOW
+    // already makes this fail on its own, with its own (tested) error kind
+    // -- this check only needs to keep FIFOs/sockets/devices from being
+    // opened. follow=true (follow_links=true) omits O_NOFOLLOW so a
+    // symlink resolves instead, matching that mode's semantics everywhere
+    // else in this vmod
+    let mut flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    if !follow {
+        flags |= libc::O_NOFOLLOW;
+    }
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), cname.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let md = file.metadata()?;
+    if !md.is_file() && !md.is_dir() {
         return Err(std::io::ErrorKind::PermissionDenied.into());
     }
-    dir.open_file(name)
+    Ok(file)
 }
 
-// same guard as open_regular(), for the follow_links=true (no openat::Dir)
-// code paths, which resolve paths via plain std::fs instead
-fn open_regular_at(path: &std::path::Path) -> std::io::Result<File> {
-    if let Ok(md) = std::fs::metadata(path)
-        && !md.is_file()
-        && !md.is_dir()
-    {
+// same guard as open_regular_at(), for the follow_links=true (no openat::Dir)
+// code paths, which resolve paths via plain std::fs instead -- no
+// O_NOFOLLOW here, since follow_links=true means symlinks should resolve
+fn open_regular(path: &std::path::Path) -> std::io::Result<File> {
+    let cpath = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()))
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let fd = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let md = file.metadata()?;
+    if !md.is_file() && !md.is_dir() {
         return Err(std::io::ErrorKind::PermissionDenied.into());
     }
-    File::open(path)
+    Ok(file)
 }
 
 fn generate_etag(metadata: &Metadata, modified: Option<SystemTime>) -> String {
