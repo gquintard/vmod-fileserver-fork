@@ -35,7 +35,7 @@ shell {
 	# that isn't a `char::is_control()` control character, but can still
 	# make a browser *display* the name misleadingly (e.g. disguising a
 	# ".exe" as a ".jpg") -- the classic filename-spoofing trick
-	rloname=$(printf 'evil\xe2\x80\xaegpj.exe')
+	rloname=$(printf 'evil\342\200\256gpj.exe')
 	printf %s "rlo" > "${tmpdir}/dir/$rloname"
 }
 
