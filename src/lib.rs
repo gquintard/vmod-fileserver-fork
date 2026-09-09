@@ -545,12 +545,14 @@ impl VclBackend<FileTransfer> for FileBackend {
             // and listing entries never involves a follow/no-follow
             // decision, only the per-entry lookups downstream do
             //
-            // fstat on our own already-open fd failing is not a real-world
-            // case, but handle it like any other fs error
-            let Ok(dir) = (unsafe { Dir::from_raw_fd_checked(f.into_raw_fd()) }) else {
-                beresp.set_status(403);
-                return Ok(None);
-            };
+            // from_raw_fd_checked does its own fstat, which can technically
+            // fail, but f's type can't change after open and metadata.is_dir()
+            // above already confirmed this exact fd is a directory. A failure
+            // here means our own reasoning about fd types is wrong, not
+            // attacker-controlled input, so it's worth surfacing loudly
+            // (worker abort) rather than masking it as a client-facing 403
+            let dir = unsafe { Dir::from_raw_fd_checked(f.into_raw_fd()) }
+                .expect("f was already confirmed to be a directory fd by metadata.is_dir() above");
 
             match self.find_index_file(&dir, &path) {
                 Some((idx_f, idx_meta, idx_path)) => {
